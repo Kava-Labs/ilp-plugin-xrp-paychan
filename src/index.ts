@@ -102,7 +102,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
   readonly _xrpSecret: string
   readonly _xrpAddress: string
   readonly _api: RippleAPI
-  readonly _outgoingChannelAmount: BigNumber // drops of XRp
+  readonly _outgoingChannelAmount: BigNumber // drops of XRP
   readonly _minIncomingChannelAmount: BigNumber // drops of XRP
   readonly _outgoingDisputePeriod: BigNumber // seconds
   readonly _minIncomingDisputePeriod: BigNumber // seconds
@@ -142,7 +142,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     this._xrpSecret = xrpSecret
     this._xrpAddress = deriveAddress(deriveKeypair(xrpSecret).publicKey)
 
-    this._outgoingChannelAmount = convert(xrp(outgoingChannelAmount), drop())
+    this._outgoingChannelAmount = new BigNumber(outgoingChannelAmount)
       .absoluteValue()
       .decimalPlaces(0, BigNumber.ROUND_DOWN)
 
