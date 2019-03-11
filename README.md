@@ -8,10 +8,6 @@
 
 🚨 **Expect breaking changes while this plugin is in beta.**
 
-## Overview
-
-Settle Interledger payments using payment channels on XRP
-
 ## Install
 
 ```bash
