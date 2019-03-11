@@ -368,6 +368,9 @@ export default class XrpAccount {
         destination: this.account.xrpAddress,
         settleDelay: this.master._outgoingDisputePeriod.toNumber(),
         publicKey: this.publicKey
+      },
+      {
+        sequence: this.master._sequenceNumber!++
       }
     )
 
@@ -380,14 +383,7 @@ export default class XrpAccount {
       )}`
     )
 
-    await this.master
-      ._queueTransaction(() =>
-        sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
-      )
-      .catch(err => {
-        this.master._log.error('Failed to open channel:', err)
-        throw err
-      })
+    await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
 
     const channelId = computeChannelId(
       this.master._xrpAddress,
@@ -453,6 +449,9 @@ export default class XrpAccount {
         {
           channel: channel.channelId,
           amount: fundAmount
+        },
+        {
+          sequence: this.master._sequenceNumber!++
         }
       )
 
@@ -465,14 +464,7 @@ export default class XrpAccount {
         )}`
       )
 
-      await this.master
-        ._queueTransaction(() =>
-          sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
-        )
-        .catch(err => {
-          this.master._log.error('Failed to open channel:', err)
-          throw err
-        })
+      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
 
       // TODO If refreshChannel throws, is the behavior correct?
       const updatedChannel = await this.refreshChannel(
@@ -1097,6 +1089,9 @@ export default class XrpAccount {
           signature: signature.toUpperCase(),
           publicKey,
           close: true
+        },
+        {
+          sequence: this.master._sequenceNumber!++
         }
       )
 
@@ -1128,14 +1123,7 @@ export default class XrpAccount {
         `Attempting to claim channel ${channelId} for ${format(drop(spent))}`
       )
 
-      await this.master
-        ._queueTransaction(() =>
-          sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
-        )
-        .catch(err => {
-          this.master._log.error('Failed to claim channel:', err)
-          throw err
-        })
+      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
 
       // Ensure that we've successfully fetched the updated channel details before sending a new claim
       // TODO Handle errors?

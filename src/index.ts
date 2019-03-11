@@ -111,7 +111,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
   readonly _channelWatcherInterval: BigNumber // milliseconds
   readonly _store: StoreWrapper
   readonly _log: Logger
-  _txPipeline: Promise<void> = Promise.resolve()
+  _sequenceNumber?: number
   _dataHandler: DataHandler = defaultDataHandler
   _moneyHandler: MoneyHandler = defaultMoneyHandler
 
@@ -252,19 +252,11 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     return this._accounts.get(accountName)!
   }
 
-  /**
-   * TODO Is this necessary? Does XRP allow multiple transactions simultaneously?
-   */
-  async _queueTransaction<T>(sendTransaction: () => Promise<T>) {
-    return new Promise<T>((resolve, reject) => {
-      this._txPipeline = this._txPipeline
-        .then(sendTransaction)
-        .then(resolve, reject)
-    })
-  }
-
   async connect() {
     await this._api.connect()
+
+    const { sequence } = await this._api.getAccountInfo(this._xrpAddress)
+    this._sequenceNumber = sequence
 
     // Load all accounts from the store
     await this._store.loadObject('accounts')
