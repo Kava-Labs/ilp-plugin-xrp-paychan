@@ -1073,10 +1073,17 @@ export default class XrpAccount {
         return updatedChannel
       }
 
-      const balance = convert(drop(spent), xrp()).toFixed(
+      // Ripple-lib throws if the claim isn't positive,
+      // so otherwise simply don't submit the claim
+      const claim = spent.isGreaterThan(0)
+        ? {
+            signature: signature.toUpperCase(),
+            balance: convert(drop(spent), xrp()).toFixed(
         6,
         BigNumber.ROUND_DOWN
       )
+          }
+        : {}
 
       const {
         txJSON,
@@ -1085,10 +1092,9 @@ export default class XrpAccount {
         this.master._xrpAddress,
         {
           channel: channelId,
-          balance,
-          signature: signature.toUpperCase(),
+          close: true,
           publicKey,
-          close: true
+          ...claim
         },
         {
           sequence: this.master._sequenceNumber!++
