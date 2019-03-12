@@ -670,14 +670,14 @@ export default class XrpAccount {
       ]
     }
 
-    const machinomy = getBtpSubprotocol(message, 'claim')
-    if (machinomy) {
+    const xrpPaychan = getBtpSubprotocol(message, 'claim')
+    if (xrpPaychan) {
       this.master._log.debug(
-        `Handling Machinomy claim for account ${this.account.accountName}`
+        `Handling xrpPaychan claim for account ${this.account.accountName}`
       )
 
       // If JSON is semantically invalid, this will throw
-      const claim = JSON.parse(machinomy.data.toString())
+      const claim = JSON.parse(xrpPaychan.data.toString())
 
       // TODO Add more robust schema validation
       const hasValidSchema = (o: any): o is SerializedClaim =>
