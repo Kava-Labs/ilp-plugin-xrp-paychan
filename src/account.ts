@@ -1077,6 +1077,7 @@ export default class XrpAccount {
       // so otherwise simply don't submit the claim
       const claim = spent.isGreaterThan(0)
         ? {
+            publicKey,
             signature: signature.toUpperCase(),
             balance: convert(drop(spent), xrp()).toFixed(
               6,
@@ -1093,7 +1094,6 @@ export default class XrpAccount {
         {
           channel: channelId,
           close: true,
-          publicKey,
           ...claim
         },
         {
