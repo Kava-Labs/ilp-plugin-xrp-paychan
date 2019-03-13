@@ -111,7 +111,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
   readonly _channelWatcherInterval: BigNumber // milliseconds
   readonly _store: StoreWrapper
   readonly _log: Logger
-  _sequenceNumber?: number
+  _sequenceNumber = 1
   _dataHandler: DataHandler = defaultDataHandler
   _moneyHandler: MoneyHandler = defaultMoneyHandler
 
@@ -252,11 +252,15 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     return this._accounts.get(accountName)!
   }
 
+  async _updateSequenceNumber() {
+    const { sequence } = await this._api.getAccountInfo(this._xrpAddress)
+    this._sequenceNumber = Math.max(this._sequenceNumber, sequence)
+  }
+
   async connect() {
     await this._api.connect()
 
-    const { sequence } = await this._api.getAccountInfo(this._xrpAddress)
-    this._sequenceNumber = sequence
+    await this._updateSequenceNumber()
 
     // Load all accounts from the store
     await this._store.loadObject('accounts')
