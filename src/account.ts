@@ -358,6 +358,7 @@ export default class XrpAccount {
       BigNumber.ROUND_DOWN
     )
 
+    await this.master._updateSequenceNumber()
     const {
       txJSON,
       instructions
@@ -370,7 +371,7 @@ export default class XrpAccount {
         publicKey: this.publicKey
       },
       {
-        sequence: this.master._sequenceNumber!++
+        sequence: this.master._sequenceNumber++
       }
     )
 
@@ -441,6 +442,7 @@ export default class XrpAccount {
         BigNumber.ROUND_DOWN
       )
 
+      await this.master._updateSequenceNumber()
       const {
         txJSON,
         instructions
@@ -451,7 +453,7 @@ export default class XrpAccount {
           amount: fundAmount
         },
         {
-          sequence: this.master._sequenceNumber!++
+          sequence: this.master._sequenceNumber++
         }
       )
 
@@ -655,7 +657,7 @@ export default class XrpAccount {
         `Channel close requested for account ${this.account.accountName}`
       )
 
-      await this.claimIfProfitable(false, () => Promise.resolve()).catch(err =>
+      await this.claimChannel(false).catch(err =>
         this.master._log.error(
           `Error attempting to claim channel: ${err.message}`
         )
@@ -1025,7 +1027,7 @@ export default class XrpAccount {
           }
 
           if (isDisputed(updatedChannel)) {
-            this.claimIfProfitable(true).catch((err: Error) => {
+            this.claimChannel(true).catch((err: Error) => {
               this.master._log.debug(
                 `Error attempting to claim channel: ${err.message}`
               )
@@ -1040,7 +1042,7 @@ export default class XrpAccount {
     return timer
   }
 
-  claimIfProfitable(
+  claimChannel(
     requireDisputed = false,
     authorize?: (channel: PaymentChannel, fee: BigNumber) => Promise<void>
   ) {
@@ -1073,11 +1075,20 @@ export default class XrpAccount {
         return updatedChannel
       }
 
-      const balance = convert(drop(spent), xrp()).toFixed(
-        6,
-        BigNumber.ROUND_DOWN
-      )
+      // Ripple-lib throws if the claim isn't positive,
+      // so otherwise simply don't submit the claim
+      const claim = spent.isGreaterThan(0)
+        ? {
+            publicKey,
+            signature: signature.toUpperCase(),
+            balance: convert(drop(spent), xrp()).toFixed(
+              6,
+              BigNumber.ROUND_DOWN
+            )
+          }
+        : {}
 
+      await this.master._updateSequenceNumber()
       const {
         txJSON,
         instructions
@@ -1085,20 +1096,15 @@ export default class XrpAccount {
         this.master._xrpAddress,
         {
           channel: channelId,
-          balance,
-          signature: signature.toUpperCase(),
-          publicKey,
-          close: true
+          close: true,
+          ...claim
         },
         {
-          sequence: this.master._sequenceNumber!++
+          sequence: this.master._sequenceNumber++
         }
       )
 
       const txFee = new BigNumber(instructions.fee)
-      const txFeeDrops = convert(xrp(txFee), drop())
-
-      // Check to verify it's profitable first
       if (authorize) {
         const isAuthorized = await authorize(updatedChannel, txFee)
           .then(() => true)
@@ -1107,16 +1113,6 @@ export default class XrpAccount {
         if (!isAuthorized) {
           return updatedChannel
         }
-      } else if (txFeeDrops.isGreaterThanOrEqualTo(spent)) {
-        this.master._log.debug(
-          `Not profitable to claim channel ${channelId} with ${
-            this.account.accountName
-          }: fee of ${format(xrp(txFee))} is greater than value of ${format(
-            drop(spent)
-          )}`
-        )
-
-        return updatedChannel
       }
 
       this.master._log.debug(
