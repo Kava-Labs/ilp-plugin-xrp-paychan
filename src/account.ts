@@ -358,7 +358,6 @@ export default class XrpAccount {
       BigNumber.ROUND_DOWN
     )
 
-    await this.master._updateSequenceNumber()
     const {
       txJSON,
       instructions
@@ -369,9 +368,6 @@ export default class XrpAccount {
         destination: this.account.xrpAddress,
         settleDelay: this.master._outgoingDisputePeriod.toNumber(),
         publicKey: this.publicKey
-      },
-      {
-        sequence: this.master._sequenceNumber++
       }
     )
 
@@ -442,7 +438,6 @@ export default class XrpAccount {
         BigNumber.ROUND_DOWN
       )
 
-      await this.master._updateSequenceNumber()
       const {
         txJSON,
         instructions
@@ -451,9 +446,6 @@ export default class XrpAccount {
         {
           channel: channel.channelId,
           amount: fundAmount
-        },
-        {
-          sequence: this.master._sequenceNumber++
         }
       )
 
@@ -1088,7 +1080,6 @@ export default class XrpAccount {
           }
         : {}
 
-      await this.master._updateSequenceNumber()
       const {
         txJSON,
         instructions
@@ -1098,9 +1089,6 @@ export default class XrpAccount {
           channel: channelId,
           close: true,
           ...claim
-        },
-        {
-          sequence: this.master._sequenceNumber++
         }
       )
 
