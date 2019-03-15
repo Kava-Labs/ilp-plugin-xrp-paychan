@@ -35,7 +35,8 @@ import {
   sendTransaction,
   SerializedClaim,
   spentFromChannel,
-  updateChannel
+  updateChannel,
+  hasClaim
 } from './utils/channel'
 import ReducerQueue from './utils/queue'
 
@@ -359,29 +360,29 @@ export default class XrpAccount {
     )
 
     const instructions = await this.master._queueTransaction(async () => {
-    const {
-      txJSON,
-      instructions
-    } = await this.master._api.preparePaymentChannelCreate(
-      this.master._xrpAddress,
-      {
-        amount: fundAmount,
+      const {
+        txJSON,
+        instructions
+      } = await this.master._api.preparePaymentChannelCreate(
+        this.master._xrpAddress,
+        {
+          amount: fundAmount,
           destination: this.account.xrpAddress!,
-        settleDelay: this.master._outgoingDisputePeriod.toNumber(),
-        publicKey: this.publicKey
-      }
-    )
+          settleDelay: this.master._outgoingDisputePeriod.toNumber(),
+          publicKey: this.publicKey
+        }
+      )
 
-    const txFee = new BigNumber(instructions.fee)
-    await authorize(txFee)
+      const txFee = new BigNumber(instructions.fee)
+      await authorize(txFee)
 
-    this.master._log.debug(
-      `Opening channel for ${format(drop(value))} and fee of ${format(
-        xrp(txFee)
-      )}`
-    )
+      this.master._log.debug(
+        `Opening channel for ${format(drop(value))} and fee of ${format(
+          xrp(txFee)
+        )}`
+      )
 
-    await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
 
       return instructions
     })
@@ -443,27 +444,27 @@ export default class XrpAccount {
       )
 
       await this.master._queueTransaction(async () => {
-      const {
-        txJSON,
-        instructions
-      } = await this.master._api.preparePaymentChannelFund(
-        this.master._xrpAddress,
-        {
-          channel: channel.channelId,
-          amount: fundAmount
-        }
-      )
+        const {
+          txJSON,
+          instructions
+        } = await this.master._api.preparePaymentChannelFund(
+          this.master._xrpAddress,
+          {
+            channel: channel.channelId,
+            amount: fundAmount
+          }
+        )
 
-      const txFee = new BigNumber(instructions.fee)
-      await authorize(txFee)
+        const txFee = new BigNumber(instructions.fee)
+        await authorize(txFee)
 
-      this.master._log.debug(
-        `Depositing ${format(drop(value))} to channel for fee of ${format(
-          xrp(txFee)
-        )}`
-      )
+        this.master._log.debug(
+          `Depositing ${format(drop(value))} to channel for fee of ${format(
+            xrp(txFee)
+          )}`
+        )
 
-      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+        await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
       })
 
       // TODO If refreshChannel throws, is the behavior correct?
@@ -985,19 +986,25 @@ export default class XrpAccount {
         )}`
       )
       this.account.payableBalance = this.account.payableBalance.plus(amount)
+
+      this.sendMoney().catch((err: Error) =>
+        this.master._log.debug('Error queueing outgoing settlement: ', err)
+      )
     } else if (isReject(reply)) {
       this.master._log.debug(
         `Received a ${reply.code} REJECT in response to the forwarded PREPARE`
       )
-    }
 
-    // Attempt to settle on fulfills *and* T04s (to resolve stalemates)
-    const shouldSettle =
-      isFulfill(reply) || (isReject(reply) && reply.code === 'T04')
-    if (shouldSettle) {
-      this.sendMoney().catch((err: Error) =>
-        this.master._log.debug('Error queueing outgoing settlement: ', err)
-      )
+      // On T04s, send the most recent claim to the peer in case they didn't get it
+      const outgoingChannel = this.account.outgoing.state
+      if (reply.code === 'T04' && hasClaim(outgoingChannel)) {
+        this.sendClaim(outgoingChannel).catch((err: Error) =>
+          this.master._log.debug(
+            'Failed to send latest claim to peer on T04 error:',
+            err
+          )
+        )
+      }
     }
   }
 
@@ -1087,34 +1094,34 @@ export default class XrpAccount {
         : {}
 
       await this.master._queueTransaction(async () => {
-      const {
-        txJSON,
-        instructions
-      } = await this.master._api.preparePaymentChannelClaim(
-        this.master._xrpAddress,
-        {
-          channel: channelId,
-          close: true,
-          ...claim
+        const {
+          txJSON,
+          instructions
+        } = await this.master._api.preparePaymentChannelClaim(
+          this.master._xrpAddress,
+          {
+            channel: channelId,
+            close: true,
+            ...claim
+          }
+        )
+
+        const txFee = new BigNumber(instructions.fee)
+        if (authorize) {
+          const isAuthorized = await authorize(updatedChannel, txFee)
+            .then(() => true)
+            .catch(() => false)
+
+          if (!isAuthorized) {
+            return updatedChannel
+          }
         }
-      )
 
-      const txFee = new BigNumber(instructions.fee)
-      if (authorize) {
-        const isAuthorized = await authorize(updatedChannel, txFee)
-          .then(() => true)
-          .catch(() => false)
+        this.master._log.debug(
+          `Attempting to claim channel ${channelId} for ${format(drop(spent))}`
+        )
 
-        if (!isAuthorized) {
-          return updatedChannel
-        }
-      }
-
-      this.master._log.debug(
-        `Attempting to claim channel ${channelId} for ${format(drop(spent))}`
-      )
-
-      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+        await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
       })
 
       // Ensure that we've successfully fetched the updated channel details before sending a new claim
