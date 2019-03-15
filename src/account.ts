@@ -358,6 +358,7 @@ export default class XrpAccount {
       BigNumber.ROUND_DOWN
     )
 
+    const instructions = await this.master._queueTransaction(async () => {
     const {
       txJSON,
       instructions
@@ -365,7 +366,7 @@ export default class XrpAccount {
       this.master._xrpAddress,
       {
         amount: fundAmount,
-        destination: this.account.xrpAddress,
+          destination: this.account.xrpAddress!,
         settleDelay: this.master._outgoingDisputePeriod.toNumber(),
         publicKey: this.publicKey
       }
@@ -381,6 +382,9 @@ export default class XrpAccount {
     )
 
     await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+
+      return instructions
+    })
 
     const channelId = computeChannelId(
       this.master._xrpAddress,
@@ -438,6 +442,7 @@ export default class XrpAccount {
         BigNumber.ROUND_DOWN
       )
 
+      await this.master._queueTransaction(async () => {
       const {
         txJSON,
         instructions
@@ -459,6 +464,7 @@ export default class XrpAccount {
       )
 
       await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+      })
 
       // TODO If refreshChannel throws, is the behavior correct?
       const updatedChannel = await this.refreshChannel(
@@ -1080,6 +1086,7 @@ export default class XrpAccount {
           }
         : {}
 
+      await this.master._queueTransaction(async () => {
       const {
         txJSON,
         instructions
@@ -1108,6 +1115,7 @@ export default class XrpAccount {
       )
 
       await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+      })
 
       // Ensure that we've successfully fetched the updated channel details before sending a new claim
       // TODO Handle errors?

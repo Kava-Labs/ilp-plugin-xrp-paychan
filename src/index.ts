@@ -113,6 +113,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
   readonly _log: Logger
   _dataHandler: DataHandler = defaultDataHandler
   _moneyHandler: MoneyHandler = defaultMoneyHandler
+  _txPipeline = Promise.resolve()
 
   constructor(
     {
@@ -249,6 +250,14 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     }
 
     return this._accounts.get(accountName)!
+  }
+
+  async _queueTransaction<T>(sendTransaction: () => Promise<T>) {
+    return new Promise<T>((resolve, reject) => {
+      this._txPipeline = this._txPipeline
+        .then(sendTransaction)
+        .then(resolve, reject)
+    })
   }
 
   async connect() {
