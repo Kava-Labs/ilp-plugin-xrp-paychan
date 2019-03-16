@@ -232,6 +232,10 @@ export const computeChannelId = (
     .toUpperCase()
 }
 
+export const hasClaim = (
+  channel?: PaymentChannel
+): channel is ClaimablePaymentChannel => !!channel && !!channel.signature
+
 export const spentFromChannel = (channel?: PaymentChannel): BigNumber =>
   channel ? channel.spent : new BigNumber(0)
 
