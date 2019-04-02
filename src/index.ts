@@ -149,6 +149,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     this._minIncomingChannelAmount = new BigNumber(minIncomingChannelAmount)
       .absoluteValue()
       .decimalPlaces(0, BigNumber.ROUND_DOWN)
+
     this._minIncomingDisputePeriod = new BigNumber(minIncomingDisputePeriod)
       .absoluteValue()
       .decimalPlaces(0, BigNumber.ROUND_CEIL)
@@ -299,20 +300,12 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     return this._plugin.isConnected()
   }
 
-  async sendData(data: Buffer) {
+  sendData(data: Buffer) {
     return this._plugin.sendData(data)
   }
 
-  async sendMoney(amount: string) {
-    const peerAccount = this._accounts.get('peer')
-    if (peerAccount) {
-      // If the plugin is acting as a client, enable sendMoney (required for prefunding)
-      await peerAccount.sendMoney(amount)
-    } else {
-      this._log.error(
-        'sendMoney is not supported: use plugin balance configuration instead of connector balance for settlement'
-      )
-    }
+  sendMoney(amount: string) {
+    return this._plugin.sendMoney(amount)
   }
 
   registerDataHandler(dataHandler: DataHandler) {

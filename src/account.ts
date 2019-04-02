@@ -111,8 +111,7 @@ export interface AccountData {
 }
 
 enum IncomingTaskPriority {
-  ClaimChannel = 3,
-  ChannelWatcher = 2,
+  ClaimChannel = 2,
   ValidateClaim = 1
 }
 
@@ -398,25 +397,19 @@ export default class XrpAccount {
     const newChannel = await this.refreshChannel(
       channelId,
       (channel): channel is PaymentChannel => !!channel
-    )().then(
-      async channel =>
-        channel &&
-        // Send a zero amount claim to the peer so they'll link the channel
-        this.sendClaim(this.signClaim(new BigNumber(0), channel))
-          .catch(err =>
-            this.master._log.error(
-              'Error sending proof-of-channel to peer: ',
-              err
-            )
-          )
-          .then(() => channel)
+    )()
+
+    // Send a zero amount claim to the peer so they'll link the channel
+    const signedChannel = this.signClaim(new BigNumber(0), newChannel)
+    this.sendClaim(signedChannel).catch(err =>
+      this.master._log.error('Error sending proof-of-channel to peer: ', err)
     )
 
     this.master._log.debug(
       `Successfully opened channel for ${format(drop(value))}`
     )
 
-    return newChannel
+    return signedChannel
   }
 
   /**
@@ -472,6 +465,20 @@ export default class XrpAccount {
         channel,
         isDepositSuccessful
       )()
+
+      // Send an invalid claim with a large value to trigger the peer to refresh the channel
+      this.master._log.debug(
+        'Sending invalid claim to peer to trigger them to update channel value'
+      )
+      this.sendClaim({
+        ...updatedChannel,
+        spent: new BigNumber(updatedChannel.value),
+        signature: '0'.repeat(128)
+      }).catch(err =>
+        this.master._log.debug(
+          `Peer responded to invalid claim: ${err.message}`
+        )
+      )
 
       this.master._log.debug(
         `Successfully deposited ${format(drop(value))} to channel ${
@@ -671,27 +678,30 @@ export default class XrpAccount {
       ]
     }
 
-    const xrpPaychan = getBtpSubprotocol(message, 'claim')
-    if (xrpPaychan) {
+    const claim = getBtpSubprotocol(message, 'claim')
+    if (claim) {
       this.master._log.debug(
-        `Handling xrpPaychan claim for account ${this.account.accountName}`
+        `Handling claim for account ${this.account.accountName}`
       )
 
       // If JSON is semantically invalid, this will throw
-      const claim = JSON.parse(xrpPaychan.data.toString())
+      const parsedClaim = JSON.parse(claim.data.toString())
 
       // TODO Add more robust schema validation
       const hasValidSchema = (o: any): o is SerializedClaim =>
         typeof o.value === 'string' &&
         typeof o.channelId === 'string' &&
         typeof o.signature === 'string'
-      if (!hasValidSchema(claim)) {
+      if (!hasValidSchema(parsedClaim)) {
         this.master._log.debug('Invalid claim: schema is malformed')
         return []
       }
 
       await this.account.incoming
-        .add(this.validateClaim(claim), IncomingTaskPriority.ValidateClaim)
+        .add(
+          this.validateClaim(parsedClaim),
+          IncomingTaskPriority.ValidateClaim
+        )
         .catch(err =>
           // Don't expose internal errors, since it may not have been intentionally thrown
           this.master._log.error('Failed to validate claim: ', err)
@@ -870,17 +880,33 @@ export default class XrpAccount {
       }
     }
 
-    // Ensure the claim is positive or zero
-    // Allow claims of 0, essentially a proof of channel ownership without sending any money
+    /**
+     * Ensure the claim is positive or zero
+     * - Allow claims of 0 (essentially a proof of channel ownership without sending any money)
+     */
     const hasNegativeValue = new BigNumber(claim.value).isNegative()
     if (hasNegativeValue) {
       this.master._log.error(`Invalid claim: value is negative`)
       return cachedChannel
     }
 
-    if (!isValidClaimSignature(claim, updatedChannel)) {
+    const isSigned = isValidClaimSignature(claim, updatedChannel)
+    if (!isSigned) {
       this.master._log.debug('Invalid claim: signature is invalid')
-      return cachedChannel
+
+      /**
+       * The peer may have sent us an invalid claim to trigger a refresh of the channel state,
+       * so return a state with the (potentially) updated channel value
+       *
+       * (this is safe since we've already confirmed that the channelId used to fetch the
+       * updated channel state was the same as the previously linked channel)
+       */
+      return !cachedChannel
+        ? cachedChannel
+        : {
+            ...cachedChannel,
+            value: updatedChannel.value
+          }
     }
 
     const sufficientChannelValue = updatedChannel.value.isGreaterThanOrEqualTo(
@@ -1009,40 +1035,32 @@ export default class XrpAccount {
   }
 
   private startChannelWatcher() {
-    const timer: NodeJS.Timeout = setInterval(
-      () =>
-        this.account.incoming.add(async cachedChannel => {
-          // No channel & claim are linked: stop the channel watcher
-          if (!cachedChannel) {
-            this.watcher = null
-            clearInterval(timer)
-            return cachedChannel
-          }
+    const timer: NodeJS.Timeout = setInterval(async () => {
+      const cachedChannel = this.account.incoming.state
+      // No channel & claim are linked: stop the channel watcher
+      if (!cachedChannel) {
+        this.watcher = null
+        clearInterval(timer)
+        return
+      }
 
-          const updatedChannel = await updateChannel<ClaimablePaymentChannel>(
-            this.master._api,
-            cachedChannel
+      const updatedChannel = await updateChannel<ClaimablePaymentChannel>(
+        this.master._api,
+        cachedChannel
+      )
+
+      // If the channel is closed or closing, then add a task to the queue
+      // that will update the channel state (for real) and claim if it's closing
+      if (!updatedChannel || isDisputed(updatedChannel)) {
+        this.claimChannel(true).catch((err: Error) => {
+          this.master._log.debug(
+            `Error attempting to claim channel or confirm channel was closed: ${
+              err.message
+            }`
           )
-
-          // Channel is closed: stop the channel watcher
-          if (!updatedChannel) {
-            this.watcher = null
-            clearInterval(timer)
-            return updatedChannel
-          }
-
-          if (isDisputed(updatedChannel)) {
-            this.claimChannel(true).catch((err: Error) => {
-              this.master._log.debug(
-                `Error attempting to claim channel: ${err.message}`
-              )
-            })
-          }
-
-          return updatedChannel
-        }, IncomingTaskPriority.ChannelWatcher),
-      this.master._channelWatcherInterval.toNumber()
-    )
+        })
+      }
+    }, this.master._channelWatcherInterval.toNumber())
 
     return timer
   }

@@ -14,6 +14,8 @@
 npm i @kava-labs/ilp-plugin-xrp-paychan
 ```
 
+Node.js 10+ is recommended.
+
 ## API
 
 Here are the available options to pass to the plugin. Additional configuration options are also inherited from [ilp-plugin-btp](https://github.com/interledgerjs/ilp-plugin-btp) if the plugin is a client, and [ilp-plugin-mini-accounts](https://github.com/interledgerjs/ilp-plugin-mini-accounts) if the plugin is a server.

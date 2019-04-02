@@ -3,7 +3,7 @@ import BigNumber from 'bignumber.js'
 import { createHash } from 'crypto'
 import createLogger from 'ilp-logger'
 import libsodium from 'libsodium-wrappers'
-import { FormattedPaymentChannel, RippleAPI } from 'ripple-lib'
+import { RippleAPI, FormattedPaymentChannel } from 'ripple-lib'
 import { Outcome } from 'ripple-lib/dist/npm/transaction/types'
 import { delay } from '../account'
 const addressCodec = require('ripple-address-codec')
@@ -189,7 +189,7 @@ export const sendTransaction = async (
           )
 
           throw err
-        } else if (err.name === 'MissingLedgerHistoryError') {
+        } else if (err instanceof api.errors.MissingLedgerHistoryError) {
           await delay(200)
           return checkForTx(attempts + 1)
         } else {
