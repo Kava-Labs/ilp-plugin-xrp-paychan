@@ -149,6 +149,7 @@ export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
     this._minIncomingChannelAmount = new BigNumber(minIncomingChannelAmount)
       .absoluteValue()
       .decimalPlaces(0, BigNumber.ROUND_DOWN)
+
     this._minIncomingDisputePeriod = new BigNumber(minIncomingDisputePeriod)
       .absoluteValue()
       .decimalPlaces(0, BigNumber.ROUND_CEIL)

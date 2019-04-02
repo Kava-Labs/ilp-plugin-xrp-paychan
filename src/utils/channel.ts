@@ -3,7 +3,7 @@ import BigNumber from 'bignumber.js'
 import { createHash } from 'crypto'
 import createLogger from 'ilp-logger'
 import libsodium from 'libsodium-wrappers'
-import { RippleAPI } from 'ripple-lib'
+import { RippleAPI, FormattedPaymentChannel } from 'ripple-lib'
 import { Outcome } from 'ripple-lib/dist/npm/transaction/types'
 import { delay } from '../account'
 const addressCodec = require('ripple-address-codec')
@@ -118,7 +118,7 @@ export const fetchChannel = (
         expiration,
         cancelAfter,
         publicKey
-      } = channel
+      } = channel as FormattedPaymentChannel
 
       const disputeExpiration = expiration ? Date.parse(expiration) : Infinity
       const immutableExpiration = cancelAfter
