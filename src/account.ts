@@ -111,8 +111,8 @@ export interface AccountData {
 }
 
 enum IncomingTaskPriority {
-  ClaimChannel = 2,
-  ValidateClaim = 1
+  ClaimChannel = 1,
+  ValidateClaim = 0
 }
 
 export default class XrpAccount {
@@ -198,6 +198,13 @@ export default class XrpAccount {
       Buffer.from(publicKey)
         .toString('hex')
         .toUpperCase()
+
+    this.autoFundOutgoingChannel().catch(err => {
+      this.master._log.error(
+        'Error attempting to auto fund outgoing channel: ',
+        err
+      )
+    })
   }
 
   private persistAccountData(): void {
@@ -318,11 +325,10 @@ export default class XrpAccount {
         )
 
       const incomingChannel = this.account.incoming.state
-      const sufficientIncoming =
-        incomingChannel &&
-        incomingChannel.value.isGreaterThan(
-          this.master._minIncomingChannelAmount
-        )
+      const sufficientIncoming = (incomingChannel
+        ? incomingChannel.value
+        : new BigNumber(0)
+      ).isGreaterThanOrEqualTo(this.master._minIncomingChannelAmount)
 
       if (requiresTopUp && sufficientIncoming) {
         return cachedChannel
@@ -466,19 +472,22 @@ export default class XrpAccount {
         isDepositSuccessful
       )()
 
-      // Send an invalid claim with a large value to trigger the peer to refresh the channel
-      this.master._log.debug(
-        'Sending invalid claim to peer to trigger them to update channel value'
-      )
-      this.sendClaim({
-        ...updatedChannel,
-        spent: new BigNumber(updatedChannel.value),
-        signature: '0'.repeat(128)
-      }).catch(err =>
-        this.master._log.debug(
-          `Peer responded to invalid claim: ${err.message}`
-        )
-      )
+      this.master._log.debug('Informing peer of channel top-up')
+      this.sendMessage({
+        type: TYPE_MESSAGE,
+        requestId: await generateBtpRequestId(),
+        data: {
+          protocolData: [
+            {
+              protocolName: 'channelDeposit',
+              contentType: MIME_APPLICATION_OCTET_STREAM,
+              data: Buffer.alloc(0)
+            }
+          ]
+        }
+      }).catch(err => {
+        this.master._log.error('Error informing peer of channel deposit:', err)
+      })
 
       this.master._log.debug(
         `Successfully deposited ${format(drop(value))} to channel ${
@@ -656,6 +665,71 @@ export default class XrpAccount {
       ]
     }
 
+    // If the peer says they may have deposited, check for a deposit
+    const channelDeposit = getBtpSubprotocol(message, 'channelDeposit')
+    if (channelDeposit) {
+      const cachedChannel = this.account.incoming.state
+      if (!cachedChannel) {
+        return []
+      }
+
+      // Don't block the queue while fetching channel state, since that slows down claim processing
+      this.master._log.debug('Checking if peer has deposited to channel')
+      const checkForDeposit = async (attempts = 0): Promise<void> => {
+        if (attempts > 20) {
+          return this.master._log.debug(
+            `Failed to confirm incoming deposit after several attempts`
+          )
+        }
+
+        const updatedChannel = await updateChannel(
+          this.master._api,
+          cachedChannel
+        )
+
+        if (!updatedChannel) {
+          return
+        }
+
+        const wasDeposit = updatedChannel.value.isGreaterThan(
+          cachedChannel.value
+        )
+        if (!wasDeposit) {
+          await delay(250)
+          return checkForDeposit(attempts + 1)
+        }
+
+        // Rectify the two forked states
+        await this.account.incoming.add(async newCachedChannel => {
+          // Ensure it's the same channel, except for the value. Otherwise, don't update.
+          const isSameChannel =
+            newCachedChannel &&
+            newCachedChannel.channelId === cachedChannel.channelId
+          if (!newCachedChannel || !isSameChannel) {
+            this.master._log.debug(
+              `Incoming channel was closed while confirming deposit: reverting to old state`
+            )
+
+            // Revert to old state
+            return newCachedChannel
+          }
+
+          // Only update the state with the new value of the channel
+          this.master._log.debug('Confirmed deposit to incoming channel')
+          return {
+            ...newCachedChannel,
+            value: BigNumber.max(updatedChannel.value, newCachedChannel.value)
+          }
+        })
+      }
+
+      await checkForDeposit().catch(err => {
+        this.master._log.error('Error confirming incoming deposit:', err)
+      })
+
+      return []
+    }
+
     // If the peer requests to close a channel, try to close it, if it's profitable
     const requestClose = getBtpSubprotocol(message, 'requestClose')
     if (requestClose) {
@@ -698,10 +772,7 @@ export default class XrpAccount {
       }
 
       await this.account.incoming
-        .add(
-          this.validateClaim(parsedClaim),
-          IncomingTaskPriority.ValidateClaim
-        )
+        .add(this.validateClaim(parsedClaim))
         .catch(err =>
           // Don't expose internal errors, since it may not have been intentionally thrown
           this.master._log.error('Failed to validate claim: ', err)
@@ -795,6 +866,11 @@ export default class XrpAccount {
     return []
   }
 
+  /**
+   * Given an unvalidated claim and the current channel state, return either:
+   * (1) the previous state, or
+   * (2) new state updated with the valid claim
+   */
   validateClaim = (claim: SerializedClaim) => async (
     cachedChannel: ClaimablePaymentChannel | undefined,
     attempts = 0
@@ -811,7 +887,7 @@ export default class XrpAccount {
     // Perform checks to link a new channel
     if (!cachedChannel) {
       if (!updatedChannel) {
-        if (attempts > 10) {
+        if (attempts > 20) {
           this.master._log.debug(
             `Invalid claim: channel ${
               claim.channelId
@@ -820,7 +896,7 @@ export default class XrpAccount {
           return cachedChannel
         }
 
-        await delay(500)
+        await delay(250)
         return this.validateClaim(claim)(cachedChannel, attempts + 1)
       }
 
@@ -893,27 +969,14 @@ export default class XrpAccount {
     const isSigned = isValidClaimSignature(claim, updatedChannel)
     if (!isSigned) {
       this.master._log.debug('Invalid claim: signature is invalid')
-
-      /**
-       * The peer may have sent us an invalid claim to trigger a refresh of the channel state,
-       * so return a state with the (potentially) updated channel value
-       *
-       * (this is safe since we've already confirmed that the channelId used to fetch the
-       * updated channel state was the same as the previously linked channel)
-       */
-      return !cachedChannel
-        ? cachedChannel
-        : {
-            ...cachedChannel,
-            value: updatedChannel.value
-          }
+      return cachedChannel
     }
 
     const sufficientChannelValue = updatedChannel.value.isGreaterThanOrEqualTo(
       claim.value
     )
     if (!sufficientChannelValue) {
-      if (attempts > 10) {
+      if (attempts > 20) {
         this.master._log.debug(
           `Invalid claim: value of ${format(
             drop(claim.value)
@@ -922,7 +985,7 @@ export default class XrpAccount {
         return cachedChannel
       }
 
-      await delay(500)
+      await delay(250)
       return this.validateClaim(claim)(cachedChannel, attempts + 1)
     }
 
