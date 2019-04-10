@@ -180,8 +180,12 @@ export const sendTransaction = async (
         log.debug(`Transaction ${id} was included in a validated ledger`)
         return outcome
       })
+      /**
+       * Ripple-lib throws if the tx isn't from a validated ledger:
+       * https://github.com/ripple/ripple-lib/blob/181cfd69de74454f1024b77dffdeb1363cbc07c1/src/ledger/transaction.ts#L86
+       */
       .catch(async (err: Error) => {
-        if (attempts > 20) {
+        if (attempts > 50) {
           log.debug(
             `Failed to verify transaction, despite several attempts: ${
               err.message
@@ -189,26 +193,20 @@ export const sendTransaction = async (
           )
 
           throw err
-        } else if (err instanceof api.errors.MissingLedgerHistoryError) {
+        }
+
+        const shouldRetry =
+          err instanceof api.errors.MissingLedgerHistoryError ||
+          err instanceof api.errors.NotFoundError
+        if (shouldRetry) {
           await delay(200)
           return checkForTx(attempts + 1)
-        } else {
-          throw err
         }
+
+        throw err
       })
 
   return checkForTx()
-}
-
-const toU32BE = (n: BigNumber.Value) => {
-  const bn = new BigNumber(n)
-  if (bn.lt('0') || bn.gte(MAX_U32)) {
-    throw new Error('number out of range for u32. n=' + n)
-  }
-
-  const buf = Buffer.alloc(4)
-  buf.writeUInt32BE(bn.toNumber(), 0)
-  return buf
 }
 
 // TODO We *should* be able to get the id from the logs of getTransaction, instead of generating it! (There's a `channelLogs` property)
@@ -217,11 +215,19 @@ export const computeChannelId = (
   receiverAddress: string,
   sequence: number
 ) => {
+  /**
+   * "A Sequence number is a 32-bit unsigned integer used to identify a transaction or Offer relative to a specific account."
+   * - https://developers.ripple.com/basic-data-types.html
+   * - Ripple-lib should ensure this a 32-bit uint
+   */
+  const sequenceBuffer = Buffer.alloc(4)
+  sequenceBuffer.writeUInt32BE(sequence, 0)
+
   const preimage = Buffer.concat([
     Buffer.from('\0x', 'ascii'),
     Buffer.from(addressCodec.decodeAccountID(senderAddress)),
     Buffer.from(addressCodec.decodeAccountID(receiverAddress)),
-    toU32BE(sequence)
+    sequenceBuffer
   ])
 
   return createHash('sha512')
@@ -257,8 +263,7 @@ export const isValidClaimSignature = (
 
 /**
  * TODO Is all this necessary? Is there a simpler BigNumber.toBuffer/toUInt64BE?
- * (for validating claims, the value will be enforced by channel
- * value on the ledger, which provides some limit)
+ * (for validating claims, the value will be enforced by channel value on the ledger, which provides some limit)
  */
 
 const MAX_U32 = '4294967296'

@@ -28,7 +28,7 @@ import { MemoryStore, StoreWrapper } from './utils/store'
 import { RippleAPI } from 'ripple-lib'
 import { deriveAddress, deriveKeypair } from 'ripple-keypairs'
 
-registerProtocolNames(['claim', 'requestClose'])
+registerProtocolNames(['claim', 'requestClose', 'channelDeposit'])
 
 // Almost never use exponential notation
 BigNumber.config({ EXPONENTIAL_AT: 1e9 })
