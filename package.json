@@ -1,6 +1,6 @@
 {
   "name": "@kava-labs/ilp-plugin-xrp-paychan",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Settle on Interledger with XRP payment channels",
   "main": "index.js",
   "types": "build/index.d.ts",
