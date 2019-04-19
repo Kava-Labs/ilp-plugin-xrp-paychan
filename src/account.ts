@@ -334,9 +334,7 @@ export default class XrpAccount {
         return cachedChannel
           ? this.depositToChannel(
               cachedChannel,
-              this.master._outgoingChannelAmount.minus(
-                remainingInChannel(cachedChannel)
-              )
+              this.master._outgoingChannelAmount
             )
           : this.openChannel(this.master._outgoingChannelAmount)
       }
@@ -430,6 +428,13 @@ export default class XrpAccount {
     // To simultaneously send payment channel claims, create a "side queue" only for the duration of the deposit
     this.depositQueue = new ReducerQueue<PaymentChannel | undefined>(channel)
 
+    // In case there were pending tasks to send claims in the main queue, try to send a claim
+    this.depositQueue
+      .add(this.createClaim.bind(this))
+      .catch(err =>
+        this.master._log.error('Error queuing task to create new claim:', err)
+      )
+
     try {
       const totalNewValue = channel.value.plus(value)
       const isDepositSuccessful = (
@@ -499,13 +504,12 @@ export default class XrpAccount {
       delete this.depositQueue // Don't await the promise so no new tasks are added to the queue
 
       // Merge the updated channel state with any claims sent in the side queue
-      // TODO Rename this
-      const alternativeState = await bestClaim
-      return alternativeState
+      const forkedState = await bestClaim
+      return forkedState
         ? {
             ...updatedChannel,
-            signature: alternativeState.signature,
-            spent: alternativeState.spent
+            signature: forkedState.signature,
+            spent: forkedState.spent
           }
         : updatedChannel
     } catch (err) {
@@ -528,25 +532,23 @@ export default class XrpAccount {
    * If no amount is specified (e.g. role=server), settle such that 0 is owed to the peer.
    */
   async sendMoney(amount?: string) {
+    const amountToSend = amount || BigNumber.max(0, this.account.payableBalance)
+    this.account.payoutAmount = this.account.payoutAmount.plus(amountToSend)
+
+    this.depositQueue
+      ? await this.depositQueue.add(this.createClaim.bind(this))
+      : await this.account.outgoing.add(this.createClaim.bind(this))
+  }
+
+  async createClaim(
+    cachedChannel: PaymentChannel | undefined
+  ): Promise<PaymentChannel | undefined> {
     this.autoFundOutgoingChannel().catch(err =>
       this.master._log.error(
         'Error attempting to auto fund outgoing channel: ',
         err
       )
     )
-
-    this.depositQueue
-      ? await this.depositQueue.add(this.createClaim(amount))
-      : await this.account.outgoing.add(this.createClaim(amount))
-  }
-
-  // TODO I'm not sure the `this` context of this works -- use a single function?
-  createClaim = (amount?: string) => async (
-    cachedChannel: PaymentChannel | undefined
-  ): Promise<PaymentChannel | undefined> => {
-    const amountToSend = amount || BigNumber.max(0, this.account.payableBalance)
-
-    this.account.payoutAmount = this.account.payoutAmount.plus(amountToSend)
 
     const settlementBudget = this.account.payoutAmount
     if (settlementBudget.isLessThanOrEqualTo(0)) {
@@ -1229,44 +1231,45 @@ export default class XrpAccount {
         return
       }
 
-      // TODO The plugin-btp default `responseTimeout` is 35 seconds -- so this might fail/timeout if the tx takes longer to mine!
-      return this.sendMessage({
-        requestId: await generateBtpRequestId(),
-        type: TYPE_MESSAGE,
-        data: {
-          protocolData: [
-            {
-              protocolName: 'requestClose',
-              contentType: MIME_TEXT_PLAIN_UTF8,
-              data: Buffer.alloc(0)
-            }
-          ]
-        }
-      })
-        .catch(err => {
-          this.master._log.debug(
-            `Error while requesting peer to claim channel: ${err.message}`
-          )
-          return cachedChannel
+      try {
+        await this.sendMessage({
+          requestId: await generateBtpRequestId(),
+          type: TYPE_MESSAGE,
+          data: {
+            protocolData: [
+              {
+                protocolName: 'requestClose',
+                contentType: MIME_TEXT_PLAIN_UTF8,
+                data: Buffer.alloc(0)
+              }
+            ]
+          }
         })
-        .then(() => {
-          // Ensure that the channel was successfully closed
-          // TODO Handle errors?
-          const updatedChannel = this.refreshChannel(
-            cachedChannel,
-            (channel): channel is undefined => !channel
-          )()
 
-          this.master._log.debug(
-            `Peer successfully closed our outgoing channel ${
-              cachedChannel.channelId
-            }, returning at least ${format(
-              drop(remainingInChannel(cachedChannel))
-            )} of collateral`
-          )
+        // Ensure that the channel was successfully closed
+        // TODO Handle errors?
+        const updatedChannel = await this.refreshChannel(
+          cachedChannel,
+          (channel): channel is undefined => !channel
+        )()
 
-          return updatedChannel
-        })
+        this.master._log.debug(
+          `Peer successfully closed our outgoing channel ${
+            cachedChannel.channelId
+          }, returning at least ${format(
+            drop(remainingInChannel(cachedChannel))
+          )} of collateral`
+        )
+
+        return updatedChannel
+      } catch (err) {
+        this.master._log.debug(
+          'Error while requesting peer to claim channel:',
+          err
+        )
+
+        return cachedChannel
+      }
     })
   }
 
