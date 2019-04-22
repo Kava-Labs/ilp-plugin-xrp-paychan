@@ -134,8 +134,14 @@ export const fetchChannel = (
         publicKey,
         disputeDelay: new BigNumber(settleDelay),
         expiresAt: expiresAt.isEqualTo(Infinity) ? undefined : expiresAt,
-        balance: convert(xrp(balance), drop()).dp(0, BigNumber.ROUND_DOWN),
-        value: convert(xrp(amount), drop()).dp(0, BigNumber.ROUND_DOWN),
+        balance: convert(xrp(balance), drop()).decimalPlaces(
+          0,
+          BigNumber.ROUND_DOWN
+        ),
+        value: convert(xrp(amount), drop()).decimalPlaces(
+          0,
+          BigNumber.ROUND_DOWN
+        ),
         spent: new BigNumber(0)
       }
     })
@@ -174,7 +180,8 @@ export const sendTransaction = async (
       .getTransaction(id)
       .then(({ outcome }) => {
         if (outcome.result !== 'tesSUCCESS') {
-          throw new Error(`Error verifying tx: ${outcome.result}`)
+          log.error(`Transaction ${id} failed: ${outcome.result}`)
+          throw new Error(outcome.result)
         }
 
         log.debug(`Transaction ${id} was included in a validated ledger`)
