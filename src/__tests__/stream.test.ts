@@ -1,89 +1,83 @@
-import getPort from 'get-port'
-import XrpPlugin from '..'
-import BigNumber from 'bignumber.js'
+import { connectXrpPlugin } from '..'
 import test from 'ava'
 import createLogger from 'ilp-logger'
 import { convert, xrp, drop } from '@kava-labs/crypto-rate-utils'
+import axios from 'axios'
+import express from 'express'
+import bodyParser from 'body-parser'
 
 test('money can be sent between two peers', async t => {
-  const port = await getPort()
+  const ALICE_URL = 'http://localhost:3000'
+  const BOB_URL = 'http://localhost:3001'
+  const RECEIVE_MONEY_URL = 'http://localhost:3002/receiveMoney'
 
-  const clientPlugin = new XrpPlugin(
-    {
-      role: 'client',
-      server: `btp+ws://:secret@localhost:${port}`,
-      xrpSecret: process.env.SECRET_A!,
-      xrpServer: 'wss://s.altnet.rippletest.net:51233'
-    },
-    {
-      log: createLogger('ilp-plugin-xrp:client')
-    }
-  )
-
-  const serverPlugin = new XrpPlugin(
-    {
-      role: 'client',
-      listener: {
-        port,
-        secret: 'secret'
-      },
-      xrpSecret: process.env.SECRET_B!,
-      xrpServer: 'wss://s.altnet.rippletest.net:51233'
-    },
-    {
-      log: createLogger('ilp-plugin-xrp:server')
-    }
-  )
-
-  await Promise.all([serverPlugin.connect(), clientPlugin.connect()])
-
-  const AMOUNT_TO_FUND = convert(xrp(2), drop())
-  const AMOUNT_TO_DEPOSIT = convert(xrp(1), drop())
-
-  const SEND_AMOUNT_1 = convert(xrp(2.3), drop())
+  const AMOUNT_TO_FUND = convert(xrp(4), drop())
+  const SEND_AMOUNT_1 = convert(xrp(1.3), drop())
   const SEND_AMOUNT_2 = convert(xrp(0.5), drop())
 
-  const pluginAccount = await clientPlugin._loadAccount('peer')
+  await connectXrpPlugin({
+    port: 3000,
+    receiveMoneyUrl: 'this_should_never_be_called',
+    sendMessageUrl: `${BOB_URL}/receiveMessage`,
+    minIncomingChannelAmount: 0,
+    outgoingChannelAmount: AMOUNT_TO_FUND,
+    xrpSecret: process.env.SECRET_A!,
+    xrpServer: 'wss://s.altnet.rippletest.net:51233',
+    log: createLogger('ilp-plugin-xrp:alice')
+  })
 
-  // Open a channel
-  await t.notThrowsAsync(
-    pluginAccount.fundOutgoingChannel(AMOUNT_TO_FUND, () => Promise.resolve()),
-    'successfully opens an outgoing chanenl'
-  )
+  await connectXrpPlugin({
+    port: 3001,
+    receiveMoneyUrl: RECEIVE_MONEY_URL,
+    sendMessageUrl: `${ALICE_URL}/receiveMessage`,
+    minIncomingChannelAmount: 0,
+    outgoingChannelAmount: AMOUNT_TO_FUND,
+    xrpSecret: process.env.SECRET_B!,
+    xrpServer: 'wss://s.altnet.rippletest.net:51233',
+    log: createLogger('ilp-plugin-xrp:bob')
+  })
 
-  // Deposit to the channel
-  await t.notThrowsAsync(
-    pluginAccount.fundOutgoingChannel(AMOUNT_TO_DEPOSIT, () =>
-      Promise.resolve()
-    ),
-    'successfully deposits to the outgoing channel'
-  )
+  // Create the accounts
+  // (since this is direct settlement engine to settlement engine, they need to use the same accountId
+  //  but this isn't necessary if used with connectors)
+
+  await axios.post(`${ALICE_URL}/createAccount`, {
+    accountId: 'peer'
+  })
+
+  await axios.post(`${BOB_URL}/createAccount`, {
+    accountId: 'peer'
+  })
+
+  const testSendReceiveMoney = (amount: string, assertionMessage: string) =>
+    new Promise(resolve => {
+      const app = express()
+      app.use(bodyParser.json())
+      const server = app.listen(3002)
+
+      app.post('/receiveMoney', (req, res) => {
+        t.is(req.body.amount, amount, assertionMessage)
+        res.sendStatus(200)
+
+        server.close()
+        resolve()
+      })
+
+      axios.post(`${ALICE_URL}/sendMoney`, {
+        accountId: 'peer',
+        amount
+      })
+    })
 
   // Ensure the initial claim can be accepted
-  serverPlugin.deregisterMoneyHandler()
-  await new Promise(async resolve => {
-    serverPlugin.registerMoneyHandler(async amount => {
-      t.true(
-        new BigNumber(amount).isEqualTo(SEND_AMOUNT_1),
-        'initial claim is sent and validated successfully between two peers'
-      )
-      resolve()
-    })
-
-    await t.notThrowsAsync(clientPlugin.sendMoney(SEND_AMOUNT_1.toString()))
-  })
+  await testSendReceiveMoney(
+    SEND_AMOUNT_1.toString(),
+    'initial claim is sent and validated successfully between two peers'
+  )
 
   // Ensure a greater claim can be accepted
-  serverPlugin.deregisterMoneyHandler()
-  await new Promise(async resolve => {
-    serverPlugin.registerMoneyHandler(async amount => {
-      t.true(
-        new BigNumber(amount).isEqualTo(SEND_AMOUNT_2),
-        'better claim is sent and validated successfully between two peers'
-      )
-      resolve()
-    })
-
-    await t.notThrowsAsync(clientPlugin.sendMoney(SEND_AMOUNT_2.toString()))
-  })
+  await testSendReceiveMoney(
+    SEND_AMOUNT_2.toString(),
+    'better claim is sent and validated successfully between two peers'
+  )
 })

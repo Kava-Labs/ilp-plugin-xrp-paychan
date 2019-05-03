@@ -1,28 +1,9 @@
 import { AssetUnit, convert, drop, xrp } from '@kava-labs/crypto-rate-utils'
 import BigNumber from 'bignumber.js'
-import {
-  MIME_APPLICATION_JSON,
-  MIME_APPLICATION_OCTET_STREAM,
-  MIME_TEXT_PLAIN_UTF8,
-  TYPE_MESSAGE
-} from 'btp-packet'
-import { createHmac, randomBytes } from 'crypto'
-import {
-  deserializeIlpPrepare,
-  deserializeIlpReply,
-  Errors,
-  errorToReject,
-  IlpPrepare,
-  IlpReply,
-  isFulfill,
-  isReject
-} from 'ilp-packet'
-import { BtpPacket, BtpPacketData, BtpSubProtocol } from 'ilp-plugin-btp'
+import { createHmac } from 'crypto'
 import libsodium from 'libsodium-wrappers'
 import { isValidAddress } from 'ripple-lib/dist/npm/common/schema-validator'
-import { promisify } from 'util'
-import XrpPlugin from '.'
-import { DataHandler, MoneyHandler } from './types/plugin'
+import { connectXrpPlugin } from '.'
 import {
   ClaimablePaymentChannel,
   computeChannelId,
@@ -35,13 +16,15 @@ import {
   sendTransaction,
   SerializedClaim,
   spentFromChannel,
-  updateChannel,
-  hasClaim
+  updateChannel
 } from './utils/channel'
 import ReducerQueue from './utils/queue'
 
 // Almost never use exponential notation
 BigNumber.config({ EXPONENTIAL_AT: 1e9 })
+
+type ThenArg<T> = T extends Promise<infer U> ? U : T
+export type SharedState = ThenArg<ReturnType<typeof connectXrpPlugin>>
 
 const CHANNEL_KEY_STRING = 'ilp-plugin-xrp-paychan-channel'
 
@@ -50,12 +33,6 @@ const hmac = (key: string | Buffer, message: string | Buffer) =>
     .update(message)
     .digest()
 
-const getBtpSubprotocol = (message: BtpPacket, name: string) =>
-  message.data.protocolData.find((p: BtpSubProtocol) => p.protocolName === name)
-
-export const generateBtpRequestId = async () =>
-  (await promisify(randomBytes)(4)).readUInt32BE(0)
-
 export const delay = (timeout: number) =>
   new Promise(r => setTimeout(r, timeout))
 
@@ -63,8 +40,6 @@ export const format = (num: AssetUnit) => convert(num, xrp()) + ' xrp'
 
 export interface SerializedAccountData {
   accountName: string
-  receivableBalance: string
-  payableBalance: string
   payoutAmount: string
   xrpAddress?: string
   incoming?: ClaimablePaymentChannel
@@ -72,18 +47,11 @@ export interface SerializedAccountData {
 }
 
 export interface AccountData {
-  /** Hash/account identifier in ILP address */
+  /** Unique account identifier */
   accountName: string
 
-  /** Incoming amount owed to us by our peer for their packets we've forwarded */
-  receivableBalance: BigNumber
-
-  /** Outgoing amount owed by us to our peer for packets we've sent to them */
-  payableBalance: BigNumber
-
   /**
-   * Amount of failed outgoing settlements that is owed to the peer, but not reflected
-   * in the payableBalance (e.g. due to sendMoney calls on client)
+   * Amount of failed outgoing settlements that is owed to the peer
    */
   payoutAmount: BigNumber
 
@@ -120,7 +88,7 @@ export default class XrpAccount {
   account: AccountData
 
   /** Expose access to common configuration across accounts */
-  private master: XrpPlugin
+  private master: SharedState
 
   /**
    * Queue for channel state/signing outgoing claims ONLY while a deposit is occuring,
@@ -128,17 +96,11 @@ export default class XrpAccount {
    */
   private depositQueue?: ReducerQueue<PaymentChannel | undefined>
 
-  /**
-   * Send the given BTP packet message to the counterparty for this account
-   * (wraps _call on internal plugin)
-   */
-  private sendMessage: (message: BtpPacket) => Promise<BtpPacketData>
+  /** Send the given message to the counterparty for this account */
+  private sendMessage: (message: object) => Promise<object>
 
-  /** Data handler from plugin for incoming ILP packets */
-  private dataHandler: DataHandler
-
-  /** Money handler from plugin for incoming money */
-  private moneyHandler: MoneyHandler
+  /** Callback triggered when incoming money is received */
+  private receiveMoney: (amount: string) => Promise<any>
 
   /** Timer/interval for channel watcher to claim incoming, disputed channels */
   private watcher: NodeJS.Timer | null
@@ -160,20 +122,17 @@ export default class XrpAccount {
     accountData,
     master,
     sendMessage,
-    dataHandler,
-    moneyHandler
+    receiveMoney
   }: {
     accountName: string
     accountData: AccountData
-    master: XrpPlugin
-    sendMessage: (message: BtpPacket) => Promise<BtpPacketData>
-    dataHandler: DataHandler
-    moneyHandler: MoneyHandler
+    master: SharedState
+    sendMessage: (message: object) => Promise<object>
+    receiveMoney: (amount: string) => Promise<any>
   }) {
     this.master = master
     this.sendMessage = sendMessage
-    this.dataHandler = dataHandler
-    this.moneyHandler = moneyHandler
+    this.receiveMoney = receiveMoney
 
     this.account = new Proxy(accountData, {
       set: (account, key, val) => {
@@ -190,7 +149,7 @@ export default class XrpAccount {
 
     // Create a unique keypair for signing claims on a per-account basis
     const { privateKey, publicKey } = libsodium.crypto_sign_seed_keypair(
-      hmac(this.master._xrpSecret, CHANNEL_KEY_STRING + accountName)
+      hmac(this.master.xrpSecret, CHANNEL_KEY_STRING + accountName)
     )
     this.privateKey = privateKey
     this.publicKey =
@@ -200,7 +159,7 @@ export default class XrpAccount {
         .toUpperCase()
 
     this.autoFundOutgoingChannel().catch(err => {
-      this.master._log.error(
+      this.master.log.error(
         'Error attempting to auto fund outgoing channel: ',
         err
       )
@@ -208,7 +167,7 @@ export default class XrpAccount {
   }
 
   private persistAccountData(): void {
-    this.master._store.set(`${this.account.accountName}:account`, this.account)
+    this.master.store.set(`${this.account.accountName}:account`, this.account)
   }
 
   /**
@@ -220,36 +179,13 @@ export default class XrpAccount {
     if (typeof this.account.xrpAddress === 'string') return
     try {
       const response = await this.sendMessage({
-        type: TYPE_MESSAGE,
-        requestId: await generateBtpRequestId(),
-        data: {
-          protocolData: [
-            {
-              protocolName: 'info',
-              contentType: MIME_APPLICATION_JSON,
-              data: Buffer.from(
-                JSON.stringify({
-                  xrpAddress: this.master._xrpAddress
-                })
-              )
-            }
-          ]
-        }
+        type: 'info',
+        xrpAddress: this.master.xrpAddress
       })
 
-      const info = response.protocolData.find(
-        (p: BtpSubProtocol) => p.protocolName === 'info'
-      )
-
-      if (info) {
-        this.linkXrpAddress(info)
-      } else {
-        this.master._log.debug(
-          `Failed to link XRP address: BTP response did not include any 'info' subprotocol data`
-        )
-      }
+      this.linkXrpAddress(response)
     } catch (err) {
-      this.master._log.debug(`Failed to exchange XRP addresses: ${err.message}`)
+      this.master.log.debug(`Failed to exchange XRP addresses: ${err.message}`)
     }
   }
 
@@ -257,18 +193,18 @@ export default class XrpAccount {
    * Validate the response to an `info` request and link
    * the provided XRP address to the account, if it's valid
    */
-  private linkXrpAddress(info: BtpSubProtocol): void {
+  private linkXrpAddress(info: any): void {
     try {
-      const { xrpAddress } = JSON.parse(info.data.toString())
+      const { xrpAddress } = info
 
       if (typeof xrpAddress !== 'string') {
-        return this.master._log.debug(
+        return this.master.log.debug(
           `Failed to link XRP address: invalid response, no address provided`
         )
       }
 
       if (!isValidAddress(xrpAddress)) {
-        return this.master._log.debug(
+        return this.master.log.debug(
           `Failed to link XRP address: not a valid address`
         )
       }
@@ -280,7 +216,7 @@ export default class XrpAccount {
           return
         }
 
-        return this.master._log.debug(
+        return this.master.log.debug(
           `Cannot link XRP address ${xrpAddress} to ${
             this.account.accountName
           }: ${currentAddress} is already linked for the lifetime of the account`
@@ -288,13 +224,13 @@ export default class XrpAccount {
       }
 
       this.account.xrpAddress = xrpAddress
-      this.master._log.debug(
+      this.master.log.debug(
         `Successfully linked XRP address ${xrpAddress} to ${
           this.account.accountName
         }`
       )
     } catch (err) {
-      this.master._log.debug(`Failed to link XRP address: ${err.message}`)
+      this.master.log.debug(`Failed to link XRP address: ${err.message}`)
     }
   }
 
@@ -325,22 +261,22 @@ export default class XrpAccount {
       const requiresTopUp =
         !cachedChannel ||
         remainingInChannel(cachedChannel).isLessThan(
-          this.master._outgoingChannelAmount.dividedBy(2)
+          this.master.outgoingChannelAmount.dividedBy(2)
         )
 
       const incomingChannel = this.account.incoming.state
       const sufficientIncoming = (incomingChannel
         ? incomingChannel.value
         : new BigNumber(0)
-      ).isGreaterThanOrEqualTo(this.master._minIncomingChannelAmount)
+      ).isGreaterThanOrEqualTo(this.master.minIncomingChannelAmount)
 
       if (requiresTopUp && sufficientIncoming) {
         return cachedChannel
           ? this.depositToChannel(
               cachedChannel,
-              this.master._outgoingChannelAmount
+              this.master.outgoingChannelAmount
             )
-          : this.openChannel(this.master._outgoingChannelAmount)
+          : this.openChannel(this.master.outgoingChannelAmount)
       }
 
       return cachedChannel
@@ -357,7 +293,7 @@ export default class XrpAccount {
   ): Promise<PaymentChannel | undefined> {
     await this.fetchXrpAddress()
     if (!this.account.xrpAddress) {
-      this.master._log.debug('Failed to open channel: no XRP address is linked')
+      this.master.log.debug('Failed to open channel: no XRP address is linked')
       return
     }
 
@@ -366,16 +302,16 @@ export default class XrpAccount {
       BigNumber.ROUND_DOWN
     )
 
-    const instructions = await this.master._queueTransaction(async () => {
+    const instructions = await this.master.queueTransaction(async () => {
       const {
         txJSON,
         instructions
-      } = await this.master._api.preparePaymentChannelCreate(
-        this.master._xrpAddress,
+      } = await this.master.api.preparePaymentChannelCreate(
+        this.master.xrpAddress,
         {
           amount: fundAmount,
           destination: this.account.xrpAddress!,
-          settleDelay: this.master._outgoingDisputePeriod.toNumber(),
+          settleDelay: this.master.outgoingDisputePeriod.toNumber(),
           publicKey: this.publicKey
         }
       )
@@ -383,19 +319,19 @@ export default class XrpAccount {
       const txFee = new BigNumber(instructions.fee)
       await authorize(txFee)
 
-      this.master._log.debug(
+      this.master.log.debug(
         `Opening channel for ${format(drop(value))} and fee of ${format(
           xrp(txFee)
         )}`
       )
 
-      await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+      await sendTransaction(txJSON, this.master.api, this.master.xrpSecret)
 
       return instructions
     })
 
     const channelId = computeChannelId(
-      this.master._xrpAddress,
+      this.master.xrpAddress,
       this.account.xrpAddress,
       instructions.sequence
     )
@@ -410,12 +346,15 @@ export default class XrpAccount {
     // Send a zero amount claim to the peer so they'll link the channel
     const signedChannel = this.signClaim(new BigNumber(0), newChannel)
     this.sendClaim(signedChannel).catch(err =>
-      this.master._log.error('Error sending proof-of-channel to peer: ', err)
+      this.master.log.error('Error sending proof-of-channel to peer: ', err)
     )
 
-    this.master._log.debug(
+    this.master.log.debug(
       `Successfully opened channel for ${format(drop(value))}`
     )
+
+    // In case we were out of capacity, try to settle up after this task is complete
+    this.sendMoney()
 
     return signedChannel
   }
@@ -436,7 +375,7 @@ export default class XrpAccount {
     this.depositQueue
       .add(this.createClaim.bind(this))
       .catch(err =>
-        this.master._log.error('Error queuing task to create new claim:', err)
+        this.master.log.error('Error queuing task to create new claim:', err)
       )
 
     try {
@@ -451,12 +390,12 @@ export default class XrpAccount {
         BigNumber.ROUND_DOWN
       )
 
-      await this.master._queueTransaction(async () => {
+      await this.master.queueTransaction(async () => {
         const {
           txJSON,
           instructions
-        } = await this.master._api.preparePaymentChannelFund(
-          this.master._xrpAddress,
+        } = await this.master.api.preparePaymentChannelFund(
+          this.master.xrpAddress,
           {
             channel: channel.channelId,
             amount: fundAmount
@@ -466,13 +405,13 @@ export default class XrpAccount {
         const txFee = new BigNumber(instructions.fee)
         await authorize(txFee)
 
-        this.master._log.debug(
+        this.master.log.debug(
           `Depositing ${format(drop(value))} to channel for fee of ${format(
             xrp(txFee)
           )}`
         )
 
-        await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+        await sendTransaction(txJSON, this.master.api, this.master.xrpSecret)
       })
 
       // TODO If refreshChannel throws, is the behavior correct?
@@ -481,24 +420,14 @@ export default class XrpAccount {
         isDepositSuccessful
       )()
 
-      this.master._log.debug('Informing peer of channel top-up')
+      this.master.log.debug('Informing peer of channel top-up')
       this.sendMessage({
-        type: TYPE_MESSAGE,
-        requestId: await generateBtpRequestId(),
-        data: {
-          protocolData: [
-            {
-              protocolName: 'channelDeposit',
-              contentType: MIME_APPLICATION_OCTET_STREAM,
-              data: Buffer.alloc(0)
-            }
-          ]
-        }
+        type: 'channelDeposit'
       }).catch(err => {
-        this.master._log.error('Error informing peer of channel deposit:', err)
+        this.master.log.error('Error informing peer of channel deposit:', err)
       })
 
-      this.master._log.debug(
+      this.master.log.debug(
         `Successfully deposited ${format(drop(value))} to channel ${
           channel.channelId
         } for total value of ${format(drop(totalNewValue))}`
@@ -506,6 +435,9 @@ export default class XrpAccount {
 
       const bestClaim = this.depositQueue.clear()
       delete this.depositQueue // Don't await the promise so no new tasks are added to the queue
+
+      // In case we were out of capacity, try to settle up after this task is complete
+      this.sendMoney()
 
       // Merge the updated channel state with any claims sent in the side queue
       const forkedState = await bestClaim
@@ -517,7 +449,7 @@ export default class XrpAccount {
           }
         : updatedChannel
     } catch (err) {
-      this.master._log.error(`Failed to deposit to channel:`, err)
+      this.master.log.error(`Failed to deposit to channel:`, err)
 
       // Since there's no updated state from the deposit, just use the state from the side queue
       const bestClaim = this.depositQueue!.clear()
@@ -529,26 +461,23 @@ export default class XrpAccount {
 
   /**
    * Send a settlement/payment channel claim to the peer, in drops of XRP
-   *
-   * If an amount is specified (e.g. role=client), try to send that amount, plus the amount of
-   * settlements that have previously failed.
-   *
-   * If no amount is specified (e.g. role=server), settle such that 0 is owed to the peer.
    */
-  async sendMoney(amount?: string) {
-    const amountToSend = amount || BigNumber.max(0, this.account.payableBalance)
-    this.account.payoutAmount = this.account.payoutAmount.plus(amountToSend)
+  // TODO Change this to a "try settle" method that just takes the payout amount
+  sendMoney(amount?: string) {
+    if (amount) {
+      this.account.payoutAmount = this.account.payoutAmount.plus(amount)
+    }
 
     this.depositQueue
-      ? await this.depositQueue.add(this.createClaim.bind(this))
-      : await this.account.outgoing.add(this.createClaim.bind(this))
+      ? this.depositQueue.add(this.createClaim.bind(this))
+      : this.account.outgoing.add(this.createClaim.bind(this))
   }
 
   async createClaim(
     cachedChannel: PaymentChannel | undefined
   ): Promise<PaymentChannel | undefined> {
     this.autoFundOutgoingChannel().catch(err =>
-      this.master._log.error(
+      this.master.log.error(
         'Error attempting to auto fund outgoing channel: ',
         err
       )
@@ -560,13 +489,13 @@ export default class XrpAccount {
     }
 
     if (!cachedChannel) {
-      this.master._log.debug(`Cannot send claim: no channel is open`)
+      this.master.log.debug(`Cannot send claim: no channel is open`)
       return cachedChannel
     }
 
     // Used to ensure the claim increment is always > 0
     if (!remainingInChannel(cachedChannel).isGreaterThan(0)) {
-      this.master._log.debug(
+      this.master.log.debug(
         `Cannot send claim to: no remaining funds in outgoing channel`
       )
       return cachedChannel
@@ -579,7 +508,7 @@ export default class XrpAccount {
       settlementBudget
     )
 
-    this.master._log.info(
+    this.master.log.info(
       `Settlement attempt triggered with ${this.account.accountName}`
     )
 
@@ -588,7 +517,7 @@ export default class XrpAccount {
 
     const updatedChannel = this.signClaim(value, cachedChannel)
 
-    this.master._log.debug(
+    this.master.log.debug(
       `Sending claim for total of ${format(
         drop(value)
       )}, incremented by ${format(drop(claimIncrement))}`
@@ -597,13 +526,7 @@ export default class XrpAccount {
     // Send paychan claim to client, don't await a response
     this.sendClaim(updatedChannel).catch(err =>
       // If they reject the claim, it's not particularly actionable
-      this.master._log.debug(
-        `Error while sending claim to peer: ${err.message}`
-      )
-    )
-
-    this.account.payableBalance = this.account.payableBalance.minus(
-      claimIncrement
+      this.master.log.debug(`Error while sending claim to peer: ${err.message}`)
     )
 
     this.account.payoutAmount = BigNumber.min(
@@ -638,58 +561,39 @@ export default class XrpAccount {
     }
 
     return this.sendMessage({
-      type: TYPE_MESSAGE,
-      requestId: await generateBtpRequestId(),
-      data: {
-        protocolData: [
-          {
-            protocolName: 'claim',
-            contentType: MIME_APPLICATION_JSON,
-            data: Buffer.from(JSON.stringify(claim))
-          }
-        ]
-      }
+      type: 'claim',
+      claim
     })
   }
 
-  async handleData(message: BtpPacket): Promise<BtpSubProtocol[]> {
+  async receiveMessage(message: any): Promise<object | void> {
     // Link the given XRP address & inform counterparty what address this wants to be paid at
-    const info = getBtpSubprotocol(message, 'info')
-    if (info) {
-      this.linkXrpAddress(info)
+    if (message.type === 'info') {
+      this.linkXrpAddress(message)
 
-      return [
-        {
-          protocolName: 'info',
-          contentType: MIME_APPLICATION_JSON,
-          data: Buffer.from(
-            JSON.stringify({
-              xrpAddress: this.master._xrpAddress
-            })
-          )
-        }
-      ]
+      return {
+        xrpAddress: this.master.xrpAddress
+      }
     }
 
     // If the peer says they may have deposited, check for a deposit
-    const channelDeposit = getBtpSubprotocol(message, 'channelDeposit')
-    if (channelDeposit) {
+    if (message.type === 'channelDeposit') {
       const cachedChannel = this.account.incoming.state
       if (!cachedChannel) {
         return []
       }
 
       // Don't block the queue while fetching channel state, since that slows down claim processing
-      this.master._log.debug('Checking if peer has deposited to channel')
+      this.master.log.debug('Checking if peer has deposited to channel')
       const checkForDeposit = async (attempts = 0): Promise<void> => {
         if (attempts > 20) {
-          return this.master._log.debug(
+          return this.master.log.debug(
             `Failed to confirm incoming deposit after several attempts`
           )
         }
 
         const updatedChannel = await updateChannel(
-          this.master._api,
+          this.master.api,
           cachedChannel
         )
 
@@ -712,7 +616,7 @@ export default class XrpAccount {
             newCachedChannel &&
             newCachedChannel.channelId === cachedChannel.channelId
           if (!newCachedChannel || !isSameChannel) {
-            this.master._log.debug(
+            this.master.log.debug(
               `Incoming channel was closed while confirming deposit: reverting to old state`
             )
 
@@ -721,7 +625,7 @@ export default class XrpAccount {
           }
 
           // Only update the state with the new value of the channel
-          this.master._log.debug('Confirmed deposit to incoming channel')
+          this.master.log.debug('Confirmed deposit to incoming channel')
           return {
             ...newCachedChannel,
             value: BigNumber.max(updatedChannel.value, newCachedChannel.value)
@@ -730,59 +634,46 @@ export default class XrpAccount {
       }
 
       await checkForDeposit().catch(err => {
-        this.master._log.error('Error confirming incoming deposit:', err)
+        this.master.log.error('Error confirming incoming deposit:', err)
       })
 
       return []
     }
 
     // If the peer requests to close a channel, try to close it, if it's profitable
-    const requestClose = getBtpSubprotocol(message, 'requestClose')
-    if (requestClose) {
-      this.master._log.info(
+    if (message.type === 'requestClose') {
+      this.master.log.info(
         `Channel close requested for account ${this.account.accountName}`
       )
 
       await this.claimChannel(false).catch(err =>
-        this.master._log.error(
+        this.master.log.error(
           `Error attempting to claim channel: ${err.message}`
         )
       )
-
-      return [
-        {
-          protocolName: 'requestClose',
-          contentType: MIME_TEXT_PLAIN_UTF8,
-          data: Buffer.alloc(0)
-        }
-      ]
     }
 
-    const claim = getBtpSubprotocol(message, 'claim')
-    if (claim) {
-      this.master._log.debug(
+    if (message.type === 'claim') {
+      this.master.log.debug(
         `Handling claim for account ${this.account.accountName}`
       )
 
-      // If JSON is semantically invalid, this will throw
-      const parsedClaim = JSON.parse(claim.data.toString())
+      const { claim } = message
 
       // TODO Add more robust schema validation
       const hasValidSchema = (o: any): o is SerializedClaim =>
         typeof o.value === 'string' &&
         typeof o.channelId === 'string' &&
         typeof o.signature === 'string'
-      if (!hasValidSchema(parsedClaim)) {
-        this.master._log.debug('Invalid claim: schema is malformed')
+      if (!hasValidSchema(claim)) {
+        this.master.log.debug('Invalid claim: schema is malformed')
         return []
       }
 
-      await this.account.incoming
-        .add(this.validateClaim(parsedClaim))
-        .catch(err =>
-          // Don't expose internal errors, since it may not have been intentionally thrown
-          this.master._log.error('Failed to validate claim: ', err)
-        )
+      await this.account.incoming.add(this.validateClaim(claim)).catch(err =>
+        // Don't expose internal errors, since it may not have been intentionally thrown
+        this.master.log.error('Failed to validate claim: ', err)
+      )
 
       /**
        * Attempt to fund an outgoing channel, if the incoming claim is accepted,
@@ -790,86 +681,12 @@ export default class XrpAccount {
        * channel already exists
        */
       this.autoFundOutgoingChannel().catch(err =>
-        this.master._log.error(
+        this.master.log.error(
           'Error attempting to auto fund outgoing channel: ',
           err
         )
       )
-
-      return []
     }
-
-    // Handle incoming ILP PREPARE packets from peer
-    // plugin-btp handles correlating the response packets for the dataHandler
-    const ilp = getBtpSubprotocol(message, 'ilp')
-    if (ilp) {
-      try {
-        const { amount } = deserializeIlpPrepare(ilp.data)
-        const amountBN = new BigNumber(amount)
-
-        if (amountBN.gt(this.master._maxPacketAmount)) {
-          throw new Errors.AmountTooLargeError('Packet size is too large.', {
-            receivedAmount: amount,
-            maximumAmount: this.master._maxPacketAmount.toString()
-          })
-        }
-
-        const newBalance = this.account.receivableBalance.plus(amount)
-        if (newBalance.isGreaterThan(this.master._maxBalance)) {
-          this.master._log.debug(
-            `Cannot forward PREPARE: cannot debit ${format(
-              drop(amount)
-            )}: proposed balance of ${format(
-              drop(newBalance)
-            )} exceeds maximum of ${format(drop(this.master._maxBalance))}`
-          )
-          throw new Errors.InsufficientLiquidityError(
-            'Exceeded maximum balance'
-          )
-        }
-
-        this.master._log.debug(
-          `Forwarding PREPARE: Debited ${format(
-            drop(amount)
-          )}, new balance is ${format(drop(newBalance))}`
-        )
-        this.account.receivableBalance = newBalance
-
-        const response = await this.dataHandler(ilp.data)
-        const reply = deserializeIlpReply(response)
-
-        if (isReject(reply)) {
-          this.master._log.debug(
-            `Credited ${format(drop(amount))} in response to REJECT`
-          )
-          this.account.receivableBalance = this.account.receivableBalance.minus(
-            amount
-          )
-        } else if (isFulfill(reply)) {
-          this.master._log.debug(
-            `Received FULFILL in response to forwarded PREPARE`
-          )
-        }
-
-        return [
-          {
-            protocolName: 'ilp',
-            contentType: MIME_APPLICATION_OCTET_STREAM,
-            data: response
-          }
-        ]
-      } catch (err) {
-        return [
-          {
-            protocolName: 'ilp',
-            contentType: MIME_APPLICATION_OCTET_STREAM,
-            data: errorToReject('', err)
-          }
-        ]
-      }
-    }
-
-    return []
   }
 
   /**
@@ -887,14 +704,14 @@ export default class XrpAccount {
       new BigNumber(claim.value).isGreaterThan(cachedChannel.value)
     // TODO Make sure using the claim id here (in fetchChannel) is safe!
     const updatedChannel = shouldFetchChannel
-      ? await fetchChannel(this.master._api, claim.channelId)
+      ? await fetchChannel(this.master.api, claim.channelId)
       : cachedChannel
 
     // Perform checks to link a new channel
     if (!cachedChannel) {
       if (!updatedChannel) {
         if (attempts > 20) {
-          this.master._log.debug(
+          this.master.log.debug(
             `Invalid claim: channel ${
               claim.channelId
             } doesn't exist, despite several attempts to refresh channel state`
@@ -908,18 +725,18 @@ export default class XrpAccount {
 
       // Ensure the channel is to this address
       // (only check for new channels, not per claim, in case the server restarts and changes config)
-      const amReceiver = updatedChannel.receiver === this.master._xrpAddress
+      const amReceiver = updatedChannel.receiver === this.master.xrpAddress
       if (!amReceiver) {
-        this.master._log.debug(
+        this.master.log.debug(
           `Invalid claim: the recipient for new channel ${
             claim.channelId
-          } is not ${this.master._xrpAddress}`
+          } is not ${this.master.xrpAddress}`
         )
         return cachedChannel
       }
 
       if (isDisputed(updatedChannel)) {
-        this.master._log.debug(
+        this.master.log.debug(
           `Invalid claim: new channel ${
             claim.channelId
           } has fixed expiration or the dispute period has already began`
@@ -929,16 +746,16 @@ export default class XrpAccount {
 
       // Confirm the dispute period for the channel is above the minimum
       const isAboveMinDisputePeriod = updatedChannel.disputeDelay.isGreaterThanOrEqualTo(
-        this.master._minIncomingDisputePeriod
+        this.master.minIncomingDisputePeriod
       )
       if (!isAboveMinDisputePeriod) {
-        this.master._log.debug(
+        this.master.log.debug(
           `Invalid claim: new channel ${
             claim.channelId
           } has dispute period of ${
             updatedChannel.disputeDelay
           } seconds, below floor of ${
-            this.master._minIncomingDisputePeriod
+            this.master.minIncomingDisputePeriod
           } seconds`
         )
         return cachedChannel
@@ -947,7 +764,7 @@ export default class XrpAccount {
     // An existing claim is linked, so validate this against the previous claim
     else {
       if (!updatedChannel) {
-        this.master._log.error(`Invalid claim: channel is unexpectedly closed`)
+        this.master.log.error(`Invalid claim: channel is unexpectedly closed`)
         return cachedChannel
       }
 
@@ -955,7 +772,7 @@ export default class XrpAccount {
       // against the previously linked channelId in `cachedChannel`
       const wrongChannel = claim.channelId !== cachedChannel.channelId
       if (wrongChannel) {
-        this.master._log.debug(
+        this.master.log.debug(
           'Invalid claim: channel is not the previously linked channel'
         )
         return cachedChannel
@@ -968,13 +785,13 @@ export default class XrpAccount {
      */
     const hasNegativeValue = new BigNumber(claim.value).isNegative()
     if (hasNegativeValue) {
-      this.master._log.error(`Invalid claim: value is negative`)
+      this.master.log.error(`Invalid claim: value is negative`)
       return cachedChannel
     }
 
     const isSigned = isValidClaimSignature(claim, updatedChannel)
     if (!isSigned) {
-      this.master._log.debug('Invalid claim: signature is invalid')
+      this.master.log.debug('Invalid claim: signature is invalid')
       return cachedChannel
     }
 
@@ -983,7 +800,7 @@ export default class XrpAccount {
     )
     if (!sufficientChannelValue) {
       if (attempts > 20) {
-        this.master._log.debug(
+        this.master.log.debug(
           `Invalid claim: value of ${format(
             drop(claim.value)
           )} is above value of channel, despite several attempts to refresh channel state`
@@ -1003,10 +820,10 @@ export default class XrpAccount {
        * - Each channel key is a mapping of channelId -> accountName
        */
       const channelKey = `${claim.channelId}:incoming-channel`
-      await this.master._store.load(channelKey)
-      const linkedAccount = this.master._store.get(channelKey)
+      await this.master.store.load(channelKey)
+      const linkedAccount = this.master.store.get(channelKey)
       if (typeof linkedAccount === 'string') {
-        this.master._log.debug(
+        this.master.log.debug(
           `Invalid claim: channel ${
             claim.channelId
           } is already linked to a different account`
@@ -1014,8 +831,8 @@ export default class XrpAccount {
         return cachedChannel
       }
 
-      this.master._store.set(channelKey, this.account.accountName)
-      this.master._log.debug(
+      this.master.store.set(channelKey, this.account.accountName)
+      this.master.log.debug(
         `Incoming channel ${claim.channelId} is now linked to account ${
           this.account.accountName
         }`
@@ -1031,7 +848,7 @@ export default class XrpAccount {
     // Claims for zero are okay, so long as it's new channel (essentially a "proof of channel")
     const isBestClaim = claimIncrement.gt(0)
     if (!isBestClaim && cachedChannel) {
-      this.master._log.debug(
+      this.master.log.debug(
         `Invalid claim: value of ${format(
           drop(claim.value)
         )} is less than previous claim for ${format(
@@ -1043,14 +860,10 @@ export default class XrpAccount {
 
     // Only perform balance operations if the claim increment is positive
     if (isBestClaim) {
-      this.account.receivableBalance = this.account.receivableBalance.minus(
-        claimIncrement
-      )
-
-      await this.moneyHandler(claimIncrement.toString())
+      await this.receiveMoney(claimIncrement.toString())
     }
 
-    this.master._log.debug(
+    this.master.log.debug(
       `Accepted incoming claim from account ${
         this.account.accountName
       } for ${format(drop(claimIncrement))}`
@@ -1069,40 +882,6 @@ export default class XrpAccount {
     }
   }
 
-  // Handle the response from a forwarded ILP PREPARE
-  handlePrepareResponse(prepare: IlpPrepare, reply: IlpReply) {
-    if (isFulfill(reply)) {
-      // Update balance to reflect that we owe them the amount of the FULFILL
-      const amount = new BigNumber(prepare.amount)
-
-      this.master._log.debug(
-        `Received a FULFILL in response to forwarded PREPARE: credited ${format(
-          drop(amount)
-        )}`
-      )
-      this.account.payableBalance = this.account.payableBalance.plus(amount)
-
-      this.sendMoney().catch((err: Error) =>
-        this.master._log.debug('Error queueing outgoing settlement: ', err)
-      )
-    } else if (isReject(reply)) {
-      this.master._log.debug(
-        `Received a ${reply.code} REJECT in response to the forwarded PREPARE`
-      )
-
-      // On T04s, send the most recent claim to the peer in case they didn't get it
-      const outgoingChannel = this.account.outgoing.state
-      if (reply.code === 'T04' && hasClaim(outgoingChannel)) {
-        this.sendClaim(outgoingChannel).catch((err: Error) =>
-          this.master._log.debug(
-            'Failed to send latest claim to peer on T04 error:',
-            err
-          )
-        )
-      }
-    }
-  }
-
   private startChannelWatcher() {
     const timer: NodeJS.Timeout = setInterval(async () => {
       const cachedChannel = this.account.incoming.state
@@ -1114,7 +893,7 @@ export default class XrpAccount {
       }
 
       const updatedChannel = await updateChannel<ClaimablePaymentChannel>(
-        this.master._api,
+        this.master.api,
         cachedChannel
       )
 
@@ -1122,14 +901,14 @@ export default class XrpAccount {
       // that will update the channel state (for real) and claim if it's closing
       if (!updatedChannel || isDisputed(updatedChannel)) {
         this.claimChannel(true).catch((err: Error) => {
-          this.master._log.debug(
+          this.master.log.debug(
             `Error attempting to claim channel or confirm channel was closed: ${
               err.message
             }`
           )
         })
       }
-    }, this.master._channelWatcherInterval.toNumber())
+    }, this.master.channelWatcherInterval.toNumber())
 
     return timer
   }
@@ -1143,12 +922,9 @@ export default class XrpAccount {
         return cachedChannel
       }
 
-      const updatedChannel = await updateChannel(
-        this.master._api,
-        cachedChannel
-      )
+      const updatedChannel = await updateChannel(this.master.api, cachedChannel)
       if (!updatedChannel) {
-        this.master._log.error(
+        this.master.log.error(
           `Cannot claim channel ${cachedChannel.channelId} with ${
             this.account.accountName
           }: linked channel is unexpectedly closed`
@@ -1159,7 +935,7 @@ export default class XrpAccount {
       const { channelId, spent, signature, publicKey } = updatedChannel
 
       if (requireDisputed && !isDisputed(updatedChannel)) {
-        this.master._log.debug(
+        this.master.log.debug(
           `Won't claim channel ${updatedChannel.channelId} with ${
             this.account.accountName
           }: channel is not disputed`
@@ -1180,12 +956,12 @@ export default class XrpAccount {
           }
         : {}
 
-      await this.master._queueTransaction(async () => {
+      await this.master.queueTransaction(async () => {
         const {
           txJSON,
           instructions
-        } = await this.master._api.preparePaymentChannelClaim(
-          this.master._xrpAddress,
+        } = await this.master.api.preparePaymentChannelClaim(
+          this.master.xrpAddress,
           {
             channel: channelId,
             close: true,
@@ -1204,11 +980,11 @@ export default class XrpAccount {
           }
         }
 
-        this.master._log.debug(
+        this.master.log.debug(
           `Attempting to claim channel ${channelId} for ${format(drop(spent))}`
         )
 
-        await sendTransaction(txJSON, this.master._api, this.master._xrpSecret)
+        await sendTransaction(txJSON, this.master.api, this.master.xrpSecret)
       })
 
       // Ensure that we've successfully fetched the updated channel details before sending a new claim
@@ -1218,7 +994,7 @@ export default class XrpAccount {
         (channel): channel is undefined => !channel
       )()
 
-      this.master._log.debug(
+      this.master.log.debug(
         `Successfully claimed incoming channel ${channelId} for ${format(
           drop(spent)
         )}`
@@ -1237,17 +1013,7 @@ export default class XrpAccount {
 
       try {
         await this.sendMessage({
-          requestId: await generateBtpRequestId(),
-          type: TYPE_MESSAGE,
-          data: {
-            protocolData: [
-              {
-                protocolName: 'requestClose',
-                contentType: MIME_TEXT_PLAIN_UTF8,
-                data: Buffer.alloc(0)
-              }
-            ]
-          }
+          type: 'requestClose'
         })
 
         // Ensure that the channel was successfully closed
@@ -1257,7 +1023,7 @@ export default class XrpAccount {
           (channel): channel is undefined => !channel
         )()
 
-        this.master._log.debug(
+        this.master.log.debug(
           `Peer successfully closed our outgoing channel ${
             cachedChannel.channelId
           }, returning at least ${format(
@@ -1267,7 +1033,7 @@ export default class XrpAccount {
 
         return updatedChannel
       } catch (err) {
-        this.master._log.debug(
+        this.master.log.debug(
           'Error while requesting peer to claim channel:',
           err
         )
@@ -1277,8 +1043,6 @@ export default class XrpAccount {
     })
   }
 
-  // From mini-accounts: invoked on a websocket close or error event
-  // From plugin-btp: invoked *only* when `disconnect` is called on plugin
   async disconnect(): Promise<void> {
     // Only stop the channel watcher if the channels were attempted to be closed
     if (this.watcher) {
@@ -1297,10 +1061,10 @@ export default class XrpAccount {
     this.account.incoming.removeAllListeners()
 
     // Remove account from store cache
-    this.master._store.unload(`${this.account.accountName}:account`)
+    this.master.store.unload(`${this.account.accountName}:account`)
 
     // Garbage collect the account at the top-level
-    this.master._accounts.delete(this.account.accountName)
+    this.master.accounts.delete(this.account.accountName)
   }
 
   private refreshChannel = <
@@ -1320,11 +1084,11 @@ export default class XrpAccount {
 
     const updatedChannel =
       typeof channelOrId === 'string'
-        ? ((await fetchChannel(this.master._api, channelOrId).catch(
+        ? ((await fetchChannel(this.master.api, channelOrId).catch(
             // Swallow errors since we'll throw if all attempts fail
             () => undefined
           )) as TPaymentChannel)
-        : await updateChannel(this.master._api, channelOrId)
+        : await updateChannel(this.master.api, channelOrId)
 
     return predicate(updatedChannel)
       ? // Return the new channel if the state was updated...

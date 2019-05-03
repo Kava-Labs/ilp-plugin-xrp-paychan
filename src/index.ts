@@ -1,47 +1,24 @@
 import { convert, xrp, drop } from '@kava-labs/crypto-rate-utils'
 import BigNumber from 'bignumber.js'
-import { registerProtocolNames } from 'btp-packet'
-import debug from 'debug'
-import { EventEmitter2 } from 'eventemitter2'
 import createLogger from 'ilp-logger'
-import { BtpPacket, IlpPluginBtpConstructorOptions } from 'ilp-plugin-btp'
-import XrpAccount, { SerializedAccountData } from './account'
-import { XrpClientPlugin } from './plugins/client'
-import { XrpServerPlugin, MiniAccountsOpts } from './plugins/server'
+import XrpAccount from './account'
 import {
-  DataHandler,
-  Logger,
-  MoneyHandler,
-  PluginInstance,
-  PluginServices
-} from './types/plugin'
-import {
-  updateChannel,
   remainingInChannel,
   spentFromChannel,
   PaymentChannel,
-  ClaimablePaymentChannel,
-  deserializePaymentChannel
+  ClaimablePaymentChannel
 } from './utils/channel'
 import ReducerQueue from './utils/queue'
-import { MemoryStore, StoreWrapper } from './utils/store'
+import { MemoryStore, StoreWrapper, Store } from './utils/store'
 import { RippleAPI } from 'ripple-lib'
 import { deriveAddress, deriveKeypair } from 'ripple-keypairs'
-
-registerProtocolNames(['claim', 'requestClose', 'channelDeposit'])
+import axios from 'axios'
+import express from 'express'
+import bodyParser from 'body-parser'
+import { promisify } from 'util'
 
 // Almost never use exponential notation
 BigNumber.config({ EXPONENTIAL_AT: 1e9 })
-
-// TODO Should the default handlers return ILP reject packets? Should they error period?
-
-const defaultDataHandler: DataHandler = () => {
-  throw new Error('no request handler registered')
-}
-
-const defaultMoneyHandler: MoneyHandler = () => {
-  throw new Error('no money handler registered')
-}
 
 const DAY_IN_SECONDS = 24 * 60 * 60
 
@@ -53,14 +30,23 @@ export {
   ClaimablePaymentChannel
 }
 
-export interface XrpPluginOpts
-  extends MiniAccountsOpts,
-    IlpPluginBtpConstructorOptions {
-  /**
-   * "client" to connect to a single peer or parent server that is explicity specified
-   * "server" to enable multiple clients to openly connect to the plugin
-   */
-  role: 'client' | 'server'
+interface Logger {
+  info(...msg: any[]): void
+  warn(...msg: any[]): void
+  error(...msg: any[]): void
+  debug(...msg: any[]): void
+  trace(...msg: any[]): void
+}
+
+export interface XrpPluginOpts {
+  /** Port for local server to interface with connector */
+  port: number
+
+  /** URL to send messages */
+  sendMessageUrl: string
+
+  /** URL to post incoming settlements */
+  receiveMoneyUrl: string
 
   /**
    * Secret of the XRP account used to send and receive
@@ -88,251 +74,162 @@ export interface XrpPluginOpts
   /** Number of seconds for dispute/expiry period used to create outgoing channels */
   outgoingDisputePeriod?: BigNumber.Value
 
-  /** Maximum allowed amount for incoming packets, in drops of XRP */
-  maxPacketAmount?: BigNumber.Value
-
   /** Number of milliseconds between runs of the channel watcher to check if a dispute was started */
   channelWatcherInterval?: BigNumber.Value
+
+  /** Simple key-value store for persistence of paychan claims and account metadata */
+  store?: Store
+
+  /** Logger instance for debugging */
+  log?: Logger
 }
 
-export default class XrpPlugin extends EventEmitter2 implements PluginInstance {
-  static readonly version = 2
-  readonly _plugin: XrpClientPlugin | XrpServerPlugin
-  readonly _accounts = new Map<string, XrpAccount>() // accountName -> account
-  readonly _xrpSecret: string
-  readonly _xrpAddress: string
-  readonly _api: RippleAPI
-  readonly _outgoingChannelAmount: BigNumber // drops of XRP
-  readonly _minIncomingChannelAmount: BigNumber // drops of XRP
-  readonly _outgoingDisputePeriod: BigNumber // seconds
-  readonly _minIncomingDisputePeriod: BigNumber // seconds
-  readonly _maxPacketAmount: BigNumber // drops of XRP
-  readonly _maxBalance: BigNumber // drops of XRP
-  readonly _channelWatcherInterval: BigNumber // milliseconds
-  readonly _store: StoreWrapper
-  readonly _log: Logger
-  _dataHandler: DataHandler = defaultDataHandler
-  _moneyHandler: MoneyHandler = defaultMoneyHandler
-  _txPipeline = Promise.resolve()
+export const connectXrpPlugin = async ({
+  port = 3000,
+  sendMessageUrl,
+  receiveMoneyUrl,
+  xrpSecret,
+  xrpServer = 'wss://s1.ripple.com',
+  outgoingChannelAmount = convert(xrp(5), drop()),
+  minIncomingChannelAmount = Infinity,
+  outgoingDisputePeriod = 6 * DAY_IN_SECONDS,
+  minIncomingDisputePeriod = 3 * DAY_IN_SECONDS,
+  channelWatcherInterval = new BigNumber(60 * 1000), // By default, every 60 seconds
+  log = createLogger('ilp-plugin-xrp'),
+  store = new MemoryStore()
+}: XrpPluginOpts) => {
+  const app = express()
+  app.use(bodyParser.json())
 
-  constructor(
-    {
-      role = 'client',
-      xrpSecret,
-      xrpServer = 'wss://s1.ripple.com',
-      outgoingChannelAmount = convert(xrp(5), drop()),
-      minIncomingChannelAmount = Infinity,
-      outgoingDisputePeriod = 6 * DAY_IN_SECONDS,
-      minIncomingDisputePeriod = 3 * DAY_IN_SECONDS,
-      maxPacketAmount = Infinity,
-      channelWatcherInterval = new BigNumber(60 * 1000), // By default, every 60 seconds
-      // All remaining params are passed to mini-accounts/plugin-btp
-      ...opts
-    }: XrpPluginOpts,
-    { log, store = new MemoryStore() }: PluginServices = {}
-  ) {
-    super()
+  const server = app.listen(port)
 
-    this._store = new StoreWrapper(store)
+  const api = new RippleAPI({ server: xrpServer })
+  await api.connect()
 
-    this._log = log || createLogger(`ilp-plugin-xrp-${role}`)
-    this._log.trace = this._log.trace || debug(`ilp-plugin-xrp-${role}:trace`)
+  // TODO Load old accounts from the DB
 
-    this._api = new RippleAPI({ server: xrpServer })
-    this._xrpSecret = xrpSecret
-    this._xrpAddress = deriveAddress(deriveKeypair(xrpSecret).publicKey)
+  const shared = {
+    app,
+    server,
 
-    this._outgoingChannelAmount = new BigNumber(outgoingChannelAmount)
+    accounts: new Map<string, XrpAccount>(),
+
+    store: new StoreWrapper(store),
+    log,
+
+    api,
+    xrpSecret: xrpSecret,
+    xrpAddress: deriveAddress(deriveKeypair(xrpSecret).publicKey),
+
+    txPipeline: Promise.resolve(),
+
+    outgoingChannelAmount: new BigNumber(outgoingChannelAmount)
       .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_DOWN)
+      .decimalPlaces(0, BigNumber.ROUND_DOWN),
 
-    this._minIncomingChannelAmount = new BigNumber(minIncomingChannelAmount)
+    minIncomingChannelAmount: new BigNumber(minIncomingChannelAmount)
       .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_DOWN)
+      .decimalPlaces(0, BigNumber.ROUND_DOWN),
 
-    this._minIncomingDisputePeriod = new BigNumber(minIncomingDisputePeriod)
+    minIncomingDisputePeriod: new BigNumber(minIncomingDisputePeriod)
       .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_CEIL)
+      .decimalPlaces(0, BigNumber.ROUND_CEIL),
 
-    this._outgoingDisputePeriod = new BigNumber(outgoingDisputePeriod)
+    outgoingDisputePeriod: new BigNumber(outgoingDisputePeriod)
       .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_DOWN)
+      .decimalPlaces(0, BigNumber.ROUND_DOWN),
 
-    this._maxPacketAmount = new BigNumber(maxPacketAmount)
+    channelWatcherInterval: new BigNumber(channelWatcherInterval)
       .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_DOWN)
+      .decimalPlaces(0, BigNumber.ROUND_DOWN),
 
-    this._maxBalance = new BigNumber(
-      role === 'client' ? Infinity : 0
-    ).decimalPlaces(0, BigNumber.ROUND_FLOOR)
+    queueTransaction<T>(sendTransaction: () => Promise<T>) {
+      return new Promise<T>((resolve, reject) => {
+        this.txPipeline = this.txPipeline
+          .then(sendTransaction)
+          .then(resolve, reject)
+      })
+    },
 
-    this._channelWatcherInterval = new BigNumber(channelWatcherInterval)
-      .absoluteValue()
-      .decimalPlaces(0, BigNumber.ROUND_DOWN)
-
-    const loadAccount = (accountName: string) => this._loadAccount(accountName)
-    const getAccount = (accountName: string) => {
-      const account = this._accounts.get(accountName)
-      if (!account) {
-        throw new Error(`Account ${accountName} is not yet loaded`)
+    async disconnect() {
+      // Unload all accounts: stop channel watcher and perform garbage collection
+      for (const account of this.accounts.values()) {
+        account.unload()
       }
 
-      return account
+      // Persist store if there are any pending write operations
+      await this.store.close()
+
+      await promisify(server.close)()
     }
-
-    this._plugin =
-      role === 'server'
-        ? new XrpServerPlugin(
-            { getAccount, loadAccount, ...opts },
-            { store, log }
-          )
-        : new XrpClientPlugin(
-            { getAccount, loadAccount, ...opts },
-            { store, log }
-          )
-
-    this._plugin.on('connect', () => this.emitAsync('connect'))
-    this._plugin.on('disconnect', () => this.emitAsync('disconnect'))
-    this._plugin.on('error', e => this.emitAsync('error', e))
   }
 
-  async _loadAccount(accountName: string): Promise<XrpAccount> {
-    const accountKey = `${accountName}:account`
-    await this._store.loadObject(accountKey)
+  const sendMessage = (accountName: string) => (
+    data: object
+  ): Promise<Buffer> =>
+    axios
+      .post(sendMessageUrl, {
+        accountId: accountName,
+        ...data
+      })
+      .then(res => res.data)
 
-    // TODO Add much more robust deserialization from store
-    const accountData = this._store.getObject(accountKey) as (
-      | SerializedAccountData
-      | undefined)
+  const receiveMoney = (accountName: string) => (amount: string) =>
+    axios.post(receiveMoneyUrl, {
+      accountId: accountName,
+      amount
+    })
 
-    // Account data must always be loaded from store before it's in the map
-    if (!this._accounts.has(accountName)) {
-      const account = new XrpAccount({
-        sendMessage: (message: BtpPacket) =>
-          this._plugin._sendMessage(accountName, message),
-        dataHandler: (data: Buffer) => this._dataHandler(data),
-        moneyHandler: (amount: string) => this._moneyHandler(amount),
+  app.post('/createAccount', (req, res) => {
+    const accountName = req.body.accountId
+    if (shared.accounts.has(accountName)) {
+      return res.status(500).send()
+    }
+
+    shared.accounts.set(
+      accountName,
+      new XrpAccount({
+        sendMessage: sendMessage(accountName),
+        receiveMoney: receiveMoney(accountName),
         accountName,
         accountData: {
-          ...accountData,
           accountName,
-          receivableBalance: new BigNumber(
-            accountData ? accountData.receivableBalance : 0
+          payoutAmount: new BigNumber(0),
+          incoming: new ReducerQueue<ClaimablePaymentChannel | undefined>(
+            undefined
           ),
-          payableBalance: new BigNumber(
-            accountData ? accountData.payableBalance : 0
-          ),
-          payoutAmount: new BigNumber(
-            accountData ? accountData.payoutAmount : 0
-          ),
-          incoming: new ReducerQueue(
-            accountData && accountData.incoming
-              ? await updateChannel(
-                  this._api,
-                  deserializePaymentChannel(accountData.incoming)
-                )
-              : undefined
-          ),
-          outgoing: new ReducerQueue(
-            accountData && accountData.outgoing
-              ? await updateChannel(
-                  this._api,
-                  deserializePaymentChannel(accountData.outgoing)
-                )
-              : undefined
-          )
+          outgoing: new ReducerQueue<PaymentChannel | undefined>(undefined)
         },
-        master: this
+        master: shared
       })
+    )
 
-      // Since this account didn't previosuly exist, save it in the store
-      this._accounts.set(accountName, account)
-      this._store.set('accounts', [...this._accounts.keys()])
+    res.sendStatus(200)
+  })
+
+  app.post('/receiveMessage', async (req, res) => {
+    const { accountId, ...incomingData } = req.body
+    const account = shared.accounts.get(accountId)
+    if (!account) {
+      // TODO Create the account instead of error
+      return res.status(500).send()
     }
 
-    return this._accounts.get(accountName)!
-  }
+    const outgoingData = await account.receiveMessage(incomingData)
+    res.send(outgoingData)
+  })
 
-  async _queueTransaction<T>(sendTransaction: () => Promise<T>) {
-    return new Promise<T>((resolve, reject) => {
-      this._txPipeline = this._txPipeline
-        .then(sendTransaction)
-        .then(resolve, reject)
-    })
-  }
-
-  async connect() {
-    await this._api.connect()
-
-    // Load all accounts from the store
-    await this._store.loadObject('accounts')
-    const accounts =
-      (this._store.getObject('accounts') as string[] | void) || []
-
-    for (const accountName of accounts) {
-      this._log.trace(`Loading account ${accountName} from store`)
-      await this._loadAccount(accountName)
-
-      // Throttle loading accounts to ~100 per second
-      // Most accounts should shut themselves down shortly after they're loaded
-      await new Promise(r => setTimeout(r, 10))
+  app.post('/sendMoney', async (req, res) => {
+    const accountName = req.body.accountId
+    const account = shared.accounts.get(accountName)
+    if (!account) {
+      // TODO Create the account instead of error
+      return res.status(500).send()
     }
 
-    // Don't allow any incoming messages to accounts until all initial loading is complete
-    // (this might create an issue, if an account requires _prefix to be known prior)
-    return this._plugin.connect()
-  }
+    account.sendMoney(req.body.amount)
+    res.sendStatus(200)
+  })
 
-  async disconnect() {
-    // Triggers claiming of channels on client
-    await this._plugin.disconnect()
-
-    // Unload all accounts: stop channel watcher and perform garbage collection
-    for (const account of this._accounts.values()) {
-      account.unload()
-    }
-
-    // Persist store if there are any pending write operations
-    await this._store.close()
-  }
-
-  isConnected() {
-    return this._plugin.isConnected()
-  }
-
-  sendData(data: Buffer) {
-    return this._plugin.sendData(data)
-  }
-
-  sendMoney(amount: string) {
-    return this._plugin.sendMoney(amount)
-  }
-
-  registerDataHandler(dataHandler: DataHandler) {
-    if (this._dataHandler !== defaultDataHandler) {
-      throw new Error('request handler already registered')
-    }
-
-    this._dataHandler = dataHandler
-    return this._plugin.registerDataHandler(dataHandler)
-  }
-
-  deregisterDataHandler() {
-    this._dataHandler = defaultDataHandler
-    return this._plugin.deregisterDataHandler()
-  }
-
-  registerMoneyHandler(moneyHandler: MoneyHandler) {
-    if (this._moneyHandler !== defaultMoneyHandler) {
-      throw new Error('money handler already registered')
-    }
-
-    this._moneyHandler = moneyHandler
-    return this._plugin.registerMoneyHandler(moneyHandler)
-  }
-
-  deregisterMoneyHandler() {
-    this._moneyHandler = defaultMoneyHandler
-    return this._plugin.deregisterMoneyHandler()
-  }
+  return shared
 }
