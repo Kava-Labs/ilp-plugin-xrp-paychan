@@ -199,12 +199,21 @@ export default class XrpAccount {
         .toString('hex')
         .toUpperCase()
 
-    this.autoFundOutgoingChannel().catch(err => {
-      this.master._log.error(
-        'Error attempting to auto fund outgoing channel: ',
-        err
-      )
-    })
+    /**
+     * Channel should be "auto funded" only if the client is online. For example:
+     * - The account just got created and no XRP address is linked (which requires it to be fetched from an online client)
+     * - An incoming paychan claim was received, and may put it above the threshold
+     * - An outgoing paychan claim was sent, so a top-up may be required, which likely only happened
+     *   if the client was online and e.g. just returned a FULFILL packet
+     */
+    if (!this.account.xrpAddress) {
+      this.autoFundOutgoingChannel().catch(err => {
+        this.master._log.error(
+          'Error attempting to auto fund outgoing channel: ',
+          err
+        )
+      })
+    }
   }
 
   private persistAccountData(): void {
